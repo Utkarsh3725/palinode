@@ -91,13 +91,13 @@ one (`rollback --execute`) has been removed.
 
 ### Categories — exact set
 
-Memory categories match directory names (plural), per `palinode/api/server.py:660-668`:
+Memory categories match directory names (plural), per `palinode/core/memory_write.py:_MEMORY_CATEGORY_DIRS`:
 
 ```
 people, projects, decisions, insights, research
 ```
 
-Singular variants (`person`, `project`, etc.) are **entity-ref prefixes**, not category values — see `_CATEGORY_TO_ENTITY_PREFIX` in `server.py:180-187`.
+Singular variants (`person`, `project`, etc.) are **entity-ref prefixes**, not category values — see `palinode/core/memory_write.py:_CATEGORY_TO_ENTITY_PREFIX`.
 
 ### Memory types — exact set
 
@@ -115,7 +115,7 @@ cross-language parity test guarding against drift.
 compaction, extraction, update, classification, nightly-consolidation
 ```
 
-Stored at `palinode/core/parity.py:PROMPT_TASKS`. The ADR-010 parity pass fixed the duplicate-`enum` bug at `palinode/mcp.py:624-625`; the canonical list now lives in `parity.py`.
+Stored at `palinode/core/parity.py:PROMPT_TASKS`. The ADR-010 parity pass fixed the duplicate-`enum` bug; the canonical list now lives in `parity.py`.
 
 ## Surface sugar — opt-in convenience, not parity
 
