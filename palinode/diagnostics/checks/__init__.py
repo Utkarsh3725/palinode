@@ -22,3 +22,7 @@ from palinode.diagnostics.checks import fts5_sync  # noqa: F401
 from palinode.diagnostics.checks import recall_write_health  # noqa: F401
 from palinode.diagnostics.checks import ollama_health  # noqa: F401
 from palinode.diagnostics.checks import git_identity  # noqa: F401
+from palinode.diagnostics.checks import store_tree  # noqa: F401
+from palinode.diagnostics.checks import prompts_current  # noqa: F401
+from palinode.diagnostics.checks import consolidation_targets  # noqa: F401
+from palinode.diagnostics.checks import projection_version  # noqa: F401

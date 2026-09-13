@@ -9,9 +9,12 @@ All operations run against the data repo (config.memory_dir).
 from __future__ import annotations
 
 import os
+import random
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -271,6 +274,55 @@ def _git_failure_reason(result: subprocess.CompletedProcess) -> str:
     return f"exit {result.returncode}: {first_line or '(no output)'}"
 
 
+#: Serialises the stage-and-commit pair across threads in one process. The
+#: API's save path, its backfill, and a CLI-driven bootstrap can all commit
+#: from the same server at once; without this they race each other for
+#: ``.git/index.lock`` and the loser's file stays dirty. Cross-process
+#: contention (the watcher against the API) is what the retry below is for.
+_COMMIT_LOCK = threading.Lock()
+
+#: Bounded backoff for an ``index.lock`` collision. Git holds the lock for
+#: milliseconds per commit, so a handful of short waits covers the watcher
+#: committing a cross_refs update while the API commits a save. Base delays
+#: in seconds, each jittered by up to +50%; the sum caps the worst case near
+#: a second so a *stale* lock (a crashed git) still reports promptly. Module
+#: constants so a test can shrink them.
+_INDEX_LOCK_RETRIES = 5
+_INDEX_LOCK_BACKOFF = (0.05, 0.1, 0.2, 0.3, 0.4)
+
+
+def _is_index_lock_collision(result: subprocess.CompletedProcess) -> bool:
+    """Git's "another process holds the index" signature, and nothing else.
+
+    Exit 128 with ``index.lock`` in stderr. Other exit-128 reasons (not a
+    repository, bad path spec) stay terminal — retrying those only delays
+    the honest failure.
+    """
+    return result.returncode == 128 and "index.lock" in (result.stderr or "")
+
+
+def _run_git_retrying_lock(*args: str) -> subprocess.CompletedProcess:
+    """``_run_git`` that waits out a transient ``index.lock`` collision.
+
+    Returns the last result either way: a success, a non-lock failure on the
+    first try, or the final lock failure after the retries are spent — the
+    caller's error handling is unchanged.
+    """
+    result = _run_git(*args)
+    for attempt in range(_INDEX_LOCK_RETRIES):
+        if not _is_index_lock_collision(result):
+            break
+        base = _INDEX_LOCK_BACKOFF[min(attempt, len(_INDEX_LOCK_BACKOFF) - 1)]
+        delay = base * (1 + random.random() * 0.5)  # nosec B311 - jitter, not security
+        logger.debug(
+            "git %s hit index.lock (attempt %d/%d); retrying in %.0f ms",
+            args[0], attempt + 1, _INDEX_LOCK_RETRIES, delay * 1000,
+        )
+        time.sleep(delay)
+        result = _run_git(*args)
+    return result
+
+
 def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcome:
     """Stage an explicit list of files and commit them in one commit.
 
@@ -292,6 +344,13 @@ def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcom
     "Nothing to commit" is detected locale-independently: a ``git commit``
     exit of 1 followed by ``git diff --cached --quiet`` succeeding on the
     same paths means the index holds no change for them.
+
+    Concurrency: the stage-and-commit pair holds a process-wide lock, so
+    threads in one server never race each other for ``.git/index.lock``;
+    a collision with *another* process (the watcher committing while the
+    API commits) is waited out with a short bounded backoff before it is
+    reported. A whole-store ``bootstrap-ids`` racing the watcher's
+    cross_refs commits stranded 82 files as dirty before either existed.
     """
     if not config.git.auto_commit or not file_paths:
         return CommitOutcome(False)
@@ -301,21 +360,22 @@ def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcom
         rels.append(os.path.relpath(p, config.memory_dir) if os.path.isabs(p) else p)
 
     try:
-        add = _run_git("add", "--", *rels)
-        if add.returncode != 0:
-            reason = _git_failure_reason(add)
-            logger.error("Git add failed for %r: %s", rels, reason)
-            return CommitOutcome(False, reason)
-        commit = _run_git("commit", "-m", message)
-        if commit.returncode == 0:
-            return CommitOutcome(True)
-        if commit.returncode == 1:
-            staged = _run_git("diff", "--cached", "--quiet", "--", *rels)
-            if staged.returncode == 0:
+        with _COMMIT_LOCK:
+            add = _run_git_retrying_lock("add", "--", *rels)
+            if add.returncode != 0:
+                reason = _git_failure_reason(add)
+                logger.error("Git add failed for %r: %s", rels, reason)
+                return CommitOutcome(False, reason)
+            commit = _run_git_retrying_lock("commit", "-m", message)
+            if commit.returncode == 0:
                 return CommitOutcome(True)
-        reason = _git_failure_reason(commit)
-        logger.error("Git commit failed for %r: %s", rels, reason)
-        return CommitOutcome(False, reason)
+            if commit.returncode == 1:
+                staged = _run_git("diff", "--cached", "--quiet", "--", *rels)
+                if staged.returncode == 0:
+                    return CommitOutcome(True)
+            reason = _git_failure_reason(commit)
+            logger.error("Git commit failed for %r: %s", rels, reason)
+            return CommitOutcome(False, reason)
     except (subprocess.SubprocessError, OSError) as e:
         logger.error("Git commit failed for %r: %s", rels, e, exc_info=True)
         return CommitOutcome(False, str(e))
@@ -587,6 +647,20 @@ def blame(file_path: str, search: str | None = None) -> str:
     return header + blame_output
 
 
+# A ``git log --format=%h|%aI|%s`` header line. Anchored on the hash and the
+# ISO-8601 date so a patch line can never be mistaken for one; the message is
+# the remainder and may itself contain "|". The hash width spans what %h can
+# actually produce -- core.abbrev goes down to 4, and an unabbreviated SHA-256
+# is 64 -- because the old positional split accepted any width and narrowing
+# it here would silently return no history at all.
+_HISTORY_ENTRY_RE = re.compile(
+    r"^(?P<hash>[0-9a-f]{4,64})\|(?P<date>\d{4}-\d{2}-\d{2}T[^|]*)\|(?P<message>.*)$"
+)
+
+# A ``--shortstat`` summary line, e.g. " 1 file changed, 2 insertions(+)".
+_SHORTSTAT_RE = re.compile(r"^\s+\d+ files? changed")
+
+
 def history(
     file_path: str,
     limit: int = 20,
@@ -614,36 +688,61 @@ def history(
     if not os.path.exists(os.path.join(config.memory_dir, file_path)):
         return []
 
-    # Get commits that touched this file (--follow tracks renames)
-    result = _run_git(
-        "log", f"-{limit}", "--format=%h|%aI|%s",
-        "--follow", "--", file_path
-    )
+    # One walk, not one spawn per commit: --shortstat yields the same summary
+    # line the per-commit ``diff --stat`` tail used to, and -p yields what the
+    # per-commit ``show`` did. Both are computed by the same --follow walk, so
+    # they hold across renames -- a pathspec passed to a separate ``diff``/
+    # ``show`` names the current path, which did not exist before the rename.
+    # --no-color for the same reason diff() passes it: git honours
+    # color.ui=always even down a pipe, and a painted "diff --git" line no
+    # longer matches the prefix the shortstat guard keys on.
+    args = ["log", "--no-color", f"-{limit}", "--format=%h|%aI|%s", "--shortstat"]
+    if detail == "full":
+        args += ["-p", "--unified=3"]
+    args += ["--follow", "--", file_path]
+    result = _run_git(*args)
 
     if not result.stdout.strip():
         return []
 
-    commits = []
-    for entry in result.stdout.strip().split("\n"):
-        parts = entry.split("|", 2)
-        if len(parts) == 3:
-            hash_short, date, message = parts
-            # Get the diff stat for this specific commit
-            stat = _run_git("diff", "--stat", f"{hash_short}^..{hash_short}", "--", file_path)
-            stat_line = stat.stdout.strip().split("\n")[-1] if stat.stdout.strip() else ""
-            stats = stat_line.strip() if stat_line and "changed" in stat_line else ""
-            commit: dict[str, str] = {
-                "hash": hash_short,
-                "date": date,
-                "message": message,
-                "stats": stats,
+    commits: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    diff_lines: list[str] = []
+    in_diff = False
+
+    for line in result.stdout.split("\n"):
+        header = _HISTORY_ENTRY_RE.match(line)
+        if header:
+            if current is not None:
+                if detail == "full":
+                    current["diff"] = "\n".join(diff_lines).strip()
+                commits.append(current)
+            current = {
+                "hash": header.group("hash"),
+                "date": header.group("date"),
+                "message": header.group("message"),
+                "stats": "",
             }
-            if detail == "full":
-                diff_result = _run_git(
-                    "show", "--unified=3", f"{hash_short}", "--", file_path
-                )
-                commit["diff"] = diff_result.stdout.strip()
-            commits.append(commit)
+            diff_lines = []
+            in_diff = False
+            continue
+        if current is None:
+            continue
+        if line.startswith("diff --git "):
+            in_diff = True
+        # Only before the patch body: a file's own content can contain a line
+        # that reads like a shortstat, and under detail="full" that content is
+        # in this same stream.
+        elif not in_diff and _SHORTSTAT_RE.match(line):
+            current["stats"] = line.strip()
+            continue
+        if detail == "full":
+            diff_lines.append(line)
+
+    if current is not None:
+        if detail == "full":
+            current["diff"] = "\n".join(diff_lines).strip()
+        commits.append(current)
 
     return commits
 
@@ -683,8 +782,7 @@ def last_commit(file_path: str) -> dict[str, str] | None:
     The newest-end counterpart to :func:`first_commit`: "when did this file last
     change on disk", as recorded by git. Same return shape (``hash``, ``date``,
     ``author``, ``message``) and the same ``None`` for an absent file or a path
-    with no git history. Single ``git log`` call — unlike :func:`history`, which
-    also shells out for a per-commit ``--stat``.
+    with no git history. Single ``git log`` call, as :func:`history` now is.
     """
     file_path = _resolve_memory_path(file_path)
     if not os.path.exists(os.path.join(config.memory_dir, file_path)):

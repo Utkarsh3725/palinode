@@ -18,7 +18,7 @@ import glob
 import hashlib
 import os
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Iterator

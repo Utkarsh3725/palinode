@@ -1,12 +1,19 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 import {
   buildCoreDigest,
   buildRecallContext,
   buildSessionCapture,
+  RESOLUTION_DEADLINE_MARKER,
+  trimToUnitBoundary,
   configFromEnv,
   postSessionCapture,
   PROFILES,
+  restoreMemory,
+  unretractMentions,
   userEntries,
+  withdrawForgetRequest,
   type FetchFn,
   type PalinodeConfig,
 } from "../src/index.js";
@@ -23,6 +30,12 @@ const CFG: PalinodeConfig = {
   coreMaxFiles: 10,
   coreMaxChars: 4000,
   minMessages: 3,
+  // The suites below this line pin the plain search channel — the behaviour a
+  // deadline falls back to — so they run with resolution off. The shipped
+  // default is ON; `configFromEnv` pins that, and the bounded-resolution
+  // suite runs with it enabled.
+  resolveOn: false,
+  resolveDeadlineMs: 250,
 };
 
 const ORIGIN = { project: "myproj", source: "pi-extension", harness: "pi", trigger: "session_shutdown" };
@@ -64,7 +77,7 @@ describe("the invariant the core owns", () => {
 });
 
 describe("buildRecallContext", () => {
-  it("renders search hits as bounded snippet lines", async () => {
+  it("describes cosine, keyword-only, and legacy search hits without treating rank as similarity", async () => {
     const fetchFn = stubFetch({
       "/check-triggers": [],
       "/search": {
@@ -73,12 +86,18 @@ describe("buildRecallContext", () => {
           // is the cosine the threshold knob filters on. Display must use
           // raw_score so the on-screen number matches the tunable scale.
           { rel_path: "decisions/deploy-rollback.md", score: 1.0, raw_score: 0.62, snippet: "git revert + reindex" },
+          { rel_path: "notes/keyword.md", score: 0.98, raw_score: null, snippet: "literal term" },
+          { rel_path: "notes/legacy.md", score: 0.75, snippet: "old server" },
         ],
       },
     });
     const ctx = await buildRecallContext(PROMPT, CFG, fetchFn);
-    expect(ctx).toContain("[decisions/deploy-rollback.md] (62%) git revert + reindex");
+    expect(ctx).toContain("[decisions/deploy-rollback.md] (62% match) git revert + reindex");
+    expect(ctx).toContain("[notes/keyword.md] (keyword match, rank 0.98) literal term");
+    expect(ctx).toContain("[notes/legacy.md] (rank 0.75) old server");
     expect(ctx).not.toContain("(100%)");
+    expect(ctx).not.toContain("(98%)");
+    expect(ctx).not.toContain("(75%)");
     expect(ctx).toContain("Related memories");
     expect(ctx).toContain("may be stale");
   });
@@ -184,6 +203,356 @@ describe("auth", () => {
     await postSessionCapture({ summary: "s", project: "p", source: "x", harness: "h", trigger: "t", decisions: [], blockers: [] }, cfg, fetchFn);
     expect(auths.length).toBeGreaterThan(0);
     expect(auths.every((a) => a === "Bearer t0k")).toBe(true);
+  });
+});
+
+describe("bounded resolution (the per-turn consuming hook)", () => {
+  const RCFG: PalinodeConfig = { ...CFG, resolveOn: true };
+
+  /** The three scenarios exactly as the Python suite pins them. */
+  const BUNDLES = JSON.parse(
+    readFileSync(
+      new URL("../../../tests/fixtures/resolve_bundles.json", import.meta.url),
+      "utf-8",
+    ),
+  ) as Record<string, Record<string, unknown>>;
+
+  it("injects the resolved bundle, and a scripted consumer picks the successor", async () => {
+    // The A → B replacement, resolved: a fresh session is told B, with the
+    // evidence — never A's retired wording.
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const ctx = await buildRecallContext(
+      "which endpoint does production serve from?",
+      RCFG,
+      stubFetch({ "/check-triggers": [], "/resolve": BUNDLES.current }, calls),
+    );
+    expect(calls.some((c) => c.url.includes("/resolve"))).toBe(true);
+    expect(calls.some((c) => c.url.includes("/search"))).toBe(false);
+    expect(ctx).toContain("decisions/endpoint-v2");
+    expect(ctx).toContain("Production serves traffic from endpoint bravo.");
+    expect(ctx).not.toContain("alpha");
+    expect(ctx).not.toContain(RESOLUTION_DEADLINE_MARKER);
+
+    // A scripted consumer — the crudest possible reader of the payload —
+    // picks B, not A: the answer is the line under "Current".
+    const current = ctx!
+      .split("\n")
+      .slice(ctx!.split("\n").indexOf("Current (1):") + 1)
+      .find((line) => line.startsWith("- ["));
+    expect(current).toContain("decisions/endpoint-v2");
+  });
+
+  it("budgets the bundle at the room actually left, frame subtracted", async () => {
+    let seenTimeout: number | undefined;
+    const fetchFn = (async (url: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
+      if (String(url).includes("/resolve")) {
+        // AbortSignal.timeout(ms) is opaque; the deadline is asserted through
+        // the abort behaviour in the deadline test below. Here: the payload.
+        seenTimeout = 1;
+        return new Response(JSON.stringify(BUNDLES.current), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    }) as FetchFn;
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    await buildRecallContext(PROMPT, RCFG, (async (url: unknown, init?: { body?: unknown }) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      return fetchFn(url as string, init as RequestInit);
+    }) as FetchFn);
+    expect(seenTimeout).toBe(1);
+    const resolveCall = calls.find((c) => c.url.includes("/resolve"));
+    const body = resolveCall?.body as { max_items: number; max_chars: number };
+    expect(body.max_items).toBe(3);
+    // The injection cap minus the fixed preamble: asking for the whole cap is
+    // how a conflict the server packed whole gets sliced in half on arrival.
+    expect(body.max_chars).toBeLessThan(CFG.maxChars);
+    expect(body.max_chars).toBeGreaterThan(CFG.maxChars - 400);
+  });
+
+  it("says nothing when the injection cap leaves no room for an honest answer", async () => {
+    const calls: Array<{ url: string }> = [];
+    const ctx = await buildRecallContext(
+      PROMPT,
+      { ...RCFG, maxChars: 200, triggersOn: false },
+      stubFetch({ "/resolve": BUNDLES.conflict, "/search": { results: [] } }, calls),
+    );
+    expect(ctx).toBeNull();
+    // Not even the fallback: one side of a conflict rendered as a plain hit is
+    // the failure bounded resolution exists to prevent.
+    expect(calls.some((c) => c.url.includes("/resolve"))).toBe(false);
+    expect(calls.some((c) => c.url.includes("/search"))).toBe(false);
+  });
+
+  it("trims the trigger section, never the resolved bundle, to fit the cap", async () => {
+    const ctx = await buildRecallContext(
+      PROMPT,
+      { ...RCFG, maxChars: 1200 },
+      stubFetch({
+        "/check-triggers": [{ memory_file: "a.md" }],
+        "/read": { content: "x".repeat(50_000) },
+        "/resolve": BUNDLES.conflict,
+      }),
+    );
+    expect(ctx!.length).toBeLessThanOrEqual(1200);
+    // Both sides of the conflict survived the trim.
+    expect(ctx).toContain("insights/region-a");
+    expect(ctx).toContain("insights/region-b");
+  });
+
+  it("keeps both sides of an unresolved conflict in the injected payload", async () => {
+    const ctx = await buildRecallContext(
+      "where does the cache cluster run?",
+      RCFG,
+      stubFetch({ "/check-triggers": [], "/resolve": BUNDLES.conflict }),
+    );
+    expect(ctx).toContain("insights/region-a");
+    expect(ctx).toContain("insights/region-b");
+    expect(ctx).toContain("Contested");
+    expect(ctx).toContain("no winner");
+  });
+
+  it("passes an omitted conflict through as still contested, never as settled", async () => {
+    // A tight output budget on the server side: the group did not fit, so the
+    // bundle reports it by ref. The injected payload must carry that through.
+    const tight = {
+      ...BUNDLES.conflict,
+      conflicts: [],
+      omitted_conflicts: 1,
+      omitted_conflict_refs: [["insights/region-a", "insights/region-b"]],
+      coverage: { status: "partial", reasons: ["budget_exhausted:conflicts"] },
+      text:
+        "### Resolved from memory (current state)\n\n" +
+        "Still contested, omitted for budget (1): insights/region-a ↔ insights/region-b\n\n" +
+        "Coverage: partial (budget_exhausted:conflicts)",
+      selected: [],
+    };
+    const ctx = await buildRecallContext(
+      "where does the cache cluster run?",
+      RCFG,
+      stubFetch({ "/check-triggers": [], "/resolve": tight }),
+    );
+    expect(ctx).toContain("Still contested");
+    expect(ctx).toContain("budget_exhausted:conflicts");
+    expect(ctx).toContain("insights/region-a");
+    expect(ctx).toContain("insights/region-b");
+  });
+
+  it("carries an explicit unknown rather than an older value", async () => {
+    const ctx = await buildRecallContext(
+      "what is the pipeline throughput ceiling?",
+      RCFG,
+      stubFetch({ "/check-triggers": [], "/resolve": BUNDLES.unknown }),
+    );
+    expect(ctx).toContain("Unknown");
+    expect(ctx).toContain("support_withdrawn");
+    expect(ctx).not.toContain("4000 rps");
+  });
+
+  it("falls back to today's payload on deadline — with the marker, never silently", async () => {
+    const hits = [
+      { rel_path: "decisions/deploy-rollback.md", score: 1.0, raw_score: 0.62, snippet: "git revert" },
+    ];
+    // /resolve aborts (the deadline); /search answers as it always has.
+    const fetchFn = (async (url: unknown) => {
+      if (String(url).includes("/resolve")) throw new DOMException("TimeoutError", "TimeoutError");
+      if (String(url).includes("/search")) return new Response(JSON.stringify({ results: hits }), { status: 200 });
+      return new Response("[]", { status: 200 });
+    }) as FetchFn;
+
+    const ctx = await buildRecallContext(PROMPT, RCFG, fetchFn);
+    expect(ctx).toContain(RESOLUTION_DEADLINE_MARKER);
+    expect(ctx).toContain("Related memories");
+    expect(ctx).toContain("[decisions/deploy-rollback.md] (62% match) git revert");
+
+    // The fallback body is byte-identical to the pre-resolution payload: the
+    // marker is added, nothing else moves.
+    const before = await buildRecallContext(PROMPT, CFG, fetchFn);
+    expect(ctx!.replace(`${RESOLUTION_DEADLINE_MARKER}\n`, "")).toBe(before);
+  });
+
+  it("says nothing when the deadline passes and search recalls nothing either", async () => {
+    const fetchFn = (async (url: unknown) => {
+      if (String(url).includes("/resolve")) throw new Error("deadline");
+      return new Response(JSON.stringify({ results: [] }), { status: 200 });
+    }) as FetchFn;
+    expect(await buildRecallContext(PROMPT, RCFG, fetchFn)).toBeNull();
+  });
+
+  it("says nothing when the bundle resolves to nothing", async () => {
+    const empty = {
+      selected: [], conflicts: [], replaced: [], insufficient: [],
+      omitted_conflicts: 0, coverage: { status: "complete", reasons: [] },
+      receipt_ref: null,
+      text: "### Resolved from memory (current state)\n\nNothing in memory answers this.",
+    };
+    const ctx = await buildRecallContext(
+      PROMPT, RCFG, stubFetch({ "/check-triggers": [], "/resolve": empty }),
+    );
+    expect(ctx).toBeNull();
+  });
+
+  it("takes the plain search channel when resolution is switched off", async () => {
+    const calls: Array<{ url: string }> = [];
+    await buildRecallContext(
+      PROMPT,
+      { ...RCFG, resolveOn: false },
+      stubFetch({ "/check-triggers": [], "/search": { results: [] } }, calls),
+    );
+    expect(calls.some((c) => c.url.includes("/resolve"))).toBe(false);
+    expect(calls.some((c) => c.url.includes("/search"))).toBe(true);
+  });
+
+  it("never calls /resolve when the memory channel is disabled", async () => {
+    const calls: Array<{ url: string }> = [];
+    await buildRecallContext(
+      PROMPT, { ...RCFG, maxResults: 0 }, stubFetch({ "/check-triggers": [] }, calls),
+    );
+    expect(calls.some((c) => c.url.includes("/resolve"))).toBe(false);
+  });
+
+  it("defaults to on, at a 250 ms deadline, and is switchable from the env", () => {
+    expect(configFromEnv({}).resolveOn).toBe(true);
+    expect(configFromEnv({}).resolveDeadlineMs).toBe(250);
+    expect(configFromEnv({ PALINODE_HOOK_RESOLVE: "0" }).resolveOn).toBe(false);
+    expect(configFromEnv({ PALINODE_HOOK_RESOLVE_DEADLINE: "600" }).resolveDeadlineMs).toBe(600);
+  });
+
+  it("session start does not route through resolution", async () => {
+    const calls: Array<{ url: string }> = [];
+    await buildCoreDigest(
+      RCFG,
+      stubFetch({ "/context/prime": {}, "/list": [{ file: "a.md", name: "A" }] }, calls),
+    );
+    expect(calls.some((c) => c.url.includes("/resolve"))).toBe(false);
+  });
+});
+
+describe("the final injected string is never cut inside a unit", () => {
+  const RCFG: PalinodeConfig = { ...CFG, resolveOn: true };
+
+  /** The same three scenarios the Python suite pins, as the server sends them. */
+  const BUNDLES = JSON.parse(
+    readFileSync(
+      new URL("../../../tests/fixtures/resolve_bundles.json", import.meta.url),
+      "utf-8",
+    ),
+  ) as Record<string, { text: string }>;
+
+  /** A trigger body long enough that the cap must bite somewhere. */
+  const LONG_TRIGGER = Array.from({ length: 40 }, (_, i) => `- [notes/n${i}.md] line ${i}`).join("\n");
+
+  /** The payload as the model actually receives it: one string, after every
+   *  formatting step. Asserting on anything earlier tests a payload nobody
+   *  gets. */
+  async function injected(scenario: string, maxChars: number): Promise<string | null> {
+    return buildRecallContext(
+      PROMPT,
+      { ...RCFG, maxChars },
+      stubFetch({
+        "/check-triggers": [{ memory_file: "a.md" }],
+        "/read": { content: LONG_TRIGGER },
+        "/resolve": BUNDLES[scenario],
+      }),
+    );
+  }
+
+  for (const cap of [900, 1100, 1400, 2000]) {
+    it(`keeps a contested bundle whole or named at ${cap} chars`, async () => {
+      const ctx = await injected("conflict", cap);
+      if (ctx === null) return; // below the floor: silence, pinned elsewhere
+      if (ctx.includes("insights/region-a") || ctx.includes("insights/region-b")) {
+        // One side is never alone — whichever arrived, the other did too.
+        expect(ctx).toContain("insights/region-a");
+        expect(ctx).toContain("insights/region-b");
+      }
+      // Whatever was cut, it was cut between lines.
+      expect(ctx.endsWith("\n") || !ctx.endsWith(" ")).toBe(true);
+      for (const line of BUNDLES.conflict.text.split("\n")) {
+        if (line.trim() === "" || !ctx.includes(line.slice(0, 12))) continue;
+        expect(ctx).toContain(line);
+      }
+    });
+  }
+
+  it("keeps the resolved answer's qualifiers attached to it", async () => {
+    const ctx = await injected("current", 1100);
+    expect(ctx).not.toBeNull();
+    // The row and the indented lines that qualify it travel together.
+    expect(ctx).toContain("decisions/endpoint-v2");
+    expect(ctx).toContain("    qualifiers: epistemic:fact");
+    expect(ctx).toContain("Coverage: complete");
+  });
+
+  it("keeps an explicit unknown explicit", async () => {
+    const ctx = await injected("unknown", 1100);
+    expect(ctx).toContain("insights/throughput");
+    expect(ctx).toContain("support_withdrawn");
+  });
+
+  const CONTESTED_PAYLOAD = [
+    "- [core/a.md] A — always true",
+    "- [core/b.md] B ⚠ contradicts: core/c.md",
+    "- [core/c.md] C ⚠ contradicts: core/b.md",
+  ].join("\n");
+
+  it("drops a contested block rather than halving it, and says where it went", () => {
+    const trimmed = trimToUnitBoundary(CONTESTED_PAYLOAD, 100);
+    expect(trimmed).toContain("- [core/a.md]");
+    // Neither side is rendered, because one of them could not be: a kept side
+    // beside a dropped one is the half-conflict this rule exists to prevent.
+    expect(trimmed).not.toContain("⚠ contradicts");
+    // Both are named instead, in the server's own wording.
+    expect(trimmed).toContain("⚠ 2 conflicts omitted for budget");
+    expect(trimmed).toContain("core/b.md");
+    expect(trimmed).toContain("core/c.md");
+    expect(trimmed.length).toBeLessThanOrEqual(100);
+  });
+
+  it("evicts an ordinary row to make room for the contested stub", () => {
+    // "there is a conflict here, here is where" outranks one more plain row —
+    // the same eviction rule the Python packer applies.
+    const trimmed = trimToUnitBoundary(CONTESTED_PAYLOAD, 60);
+    expect(trimmed).toBe("⚠ 2 conflicts omitted for budget — see core/b.md, core/c.md");
+  });
+
+  it("never splits a row from the qualifiers indented under it", () => {
+    const payload = [
+      "- [decisions/x] X [current] the decision",
+      "    qualifiers: epistemic:speculation",
+      "- [decisions/y] Y [current] the other decision",
+    ].join("\n");
+    const trimmed = trimToUnitBoundary(payload, 60);
+    expect(trimmed === "" || trimmed.includes("qualifiers: epistemic:speculation")).toBe(true);
+    expect(trimmed).not.toContain("decisions/y");
+  });
+
+  it("returns nothing when there is not even room for the stub", () => {
+    expect(trimToUnitBoundary("- [a/b.md] ⚠ contradicts: a/c.md", 10)).toBe("");
+  });
+
+  it("leaves a payload that already fits byte-identical", () => {
+    const payload = "- [a/b.md] one\n- [a/c.md] two";
+    expect(trimToUnitBoundary(payload, 5000)).toBe(payload);
+  });
+
+  it("keeps the startup digest and the per-turn payload on separate budgets", async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({
+      file: `core/m${i}.md`,
+      name: `Memory ${i}`,
+      summary: "x".repeat(80),
+    }));
+    const digest = await buildCoreDigest(
+      { ...RCFG, coreMaxChars: 400, maxChars: 3000 },
+      stubFetch({ "/context/prime": {}, "/list": rows }),
+    );
+    expect(digest!.length).toBeLessThanOrEqual(400);
+    // Cut between rows: no half-row, and the last line is a whole one.
+    for (const line of digest!.split("\n")) {
+      if (line.startsWith("- [")) expect(line).toMatch(/^- \[core\/m\d+\.md\] Memory \d+ — x+$/);
+    }
+    // The per-turn channel spends its own cap, untouched by the startup one.
+    const turn = await injected("current", 1100);
+    expect(turn!.length).toBeLessThanOrEqual(1100);
+    expect(turn).not.toContain("session start");
   });
 });
 
@@ -312,6 +681,8 @@ describe("configFromEnv", () => {
       coreMaxFiles: 5,
       coreMaxChars: 2000,
       minMessages: 1,
+      resolveOn: true,
+      resolveDeadlineMs: 250,
     });
   });
 
@@ -365,5 +736,71 @@ describe("configFromEnv", () => {
     expect(cfg.recallProfile).toBe("writing");
     expect(cfg.maxResults).toBe(0);
     expect(cfg.coreMaxFiles).toBe(10);
+  });
+});
+
+describe("reversal client (restore / unretract / forget-withdraw)", () => {
+  it("restoreMemory posts the canonical params to /restore and returns the result", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const fetchFn = stubFetch(
+      { "/restore": { file: "insights/x.md", status: "active", restored_from: "archived", chunks_updated: 2 } },
+      calls,
+    );
+    const out = await restoreMemory("insights/x.md", CFG, fetchFn, "wrongly retired");
+    expect(out).toMatchObject({ file: "insights/x.md", status: "active", restored_from: "archived" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("http://test:6340/restore");
+    expect(calls[0].body).toEqual({ file_path: "insights/x.md", reason: "wrongly retired" });
+  });
+
+  it("restoreMemory omits reason when not given", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    await restoreMemory("insights/x.md", CFG, stubFetch({ "/restore": { file: "insights/x.md", status: "not_archived" } }, calls));
+    expect(calls[0].body).toEqual({ file_path: "insights/x.md" });
+  });
+
+  it("unretractMentions posts file_path + pref to /unretract", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const out = await unretractMentions(
+      "projects/closeout.md",
+      "I know Wilhelmina Cragg",
+      CFG,
+      stubFetch({ "/unretract": { file: "projects/closeout.md", status: "unretracted", mentions: 2 } }, calls),
+    );
+    expect(out).toMatchObject({ status: "unretracted", mentions: 2 });
+    expect(calls[0].url).toBe("http://test:6340/unretract");
+    expect(calls[0].body).toEqual({ file_path: "projects/closeout.md", pref: "I know Wilhelmina Cragg" });
+  });
+
+  it("withdrawForgetRequest posts the request path to /forget-withdraw", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const out = await withdrawForgetRequest(
+      "insights/forget-sneakers.md",
+      CFG,
+      stubFetch(
+        {
+          "/forget-withdraw": {
+            file: "insights/forget-sneakers.md",
+            status: "withdrawn",
+            pref: "I collect vintage sneakers",
+            restored: ["insights/pref-sneakers.md"],
+            unretracted: [],
+            requests_archived: ["insights/forget-sneakers.md"],
+          },
+        },
+        calls,
+      ),
+    );
+    expect(out?.restored).toEqual(["insights/pref-sneakers.md"]);
+    expect(calls[0].url).toBe("http://test:6340/forget-withdraw");
+    expect(calls[0].body).toEqual({ file_path: "insights/forget-sneakers.md" });
+  });
+
+  it("all three fail open: API down or HTTP error resolves to null, never throws", async () => {
+    expect(await restoreMemory("insights/x.md", CFG, failingFetch)).toBeNull();
+    expect(await unretractMentions("insights/x.md", "p", CFG, failingFetch)).toBeNull();
+    expect(await withdrawForgetRequest("insights/x.md", CFG, failingFetch)).toBeNull();
+    const notFound = stubFetch({}); // unrouted → 404
+    expect(await restoreMemory("insights/x.md", CFG, notFound)).toBeNull();
   });
 });

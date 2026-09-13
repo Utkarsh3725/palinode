@@ -31,29 +31,90 @@ from palinode.core.hashing import stable_md5_hexdigest
 
 logger = logging.getLogger("palinode.ingest")
 
+# Redirect statuses whose Location the fetcher follows itself, one vetted
+# hop at a time, and the cap on how many it will follow.
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_REDIRECT_HOPS = 5
+
+
+def _is_fetchable_address(addr: str) -> bool:
+    """True only for an address the ingester is allowed to connect to.
+
+    Policy rather than enumeration: ``is_global`` is false for private,
+    loopback, link-local, carrier-grade NAT (100.64.0.0/10), reserved,
+    unspecified, and documentation ranges, in both IPv4 and IPv6. Multicast is
+    the one class ``ipaddress`` still reports as global, so it is excluded
+    explicitly.
+    """
+    try:
+        # A scoped IPv6 literal (``fe80::1%en0``) carries a zone id that
+        # ``ip_address`` rejects; the address itself is what we vet.
+        ip = ipaddress.ip_address(addr.partition("%")[0])
+    except ValueError:
+        return False
+    return ip.is_global and not ip.is_multicast
+
+
 def is_safe_url(url: str) -> bool:
-    """Validates URL for SSRF protection."""
+    """Validates URL for SSRF protection.
+
+    The host is resolved with ``getaddrinfo``, so IPv6-only hosts resolve (and
+    IPv6 non-global literals are rejected on policy rather than by accident of
+    an IPv4-only lookup). *Every* answer must be fetchable: a host that returns
+    one public and one internal address is refused outright, since which one a
+    later connect picks is not ours to choose.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return False
-            
+
         hostname = parsed.hostname
         if not hostname:
             return False
-            
+
         try:
-            ip = socket.gethostbyname(hostname)
-        except socket.gaierror:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except (OSError, ValueError, UnicodeError):
             return False
-            
-        ip_obj = ipaddress.ip_address(ip)
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
-            return False
-            
-        return True
+
+        addresses = [info[4][0] for info in infos]
+        return bool(addresses) and all(_is_fetchable_address(a) for a in addresses)
     except Exception:
         return False
+
+
+def _fetch_vetted_url(url: str) -> httpx.Response | None:
+    """GET *url*, vetting the address behind every redirect hop.
+
+    ``httpx`` is told not to follow redirects: a guard that runs once on the
+    submitted URL says nothing about where a ``Location`` header points. Each
+    hop is resolved and vetted before it is requested, and the chain is bounded
+    so a server cannot walk the fetcher through an unbounded list of targets.
+
+    Returns the final response, or ``None`` when a hop is refused (nothing is
+    fetched from it and the caller writes nothing).
+    """
+    current = url
+    for _ in range(_MAX_REDIRECT_HOPS + 1):
+        if not is_safe_url(current):
+            logger.error(f"URL fetch blocked by SSRF protection: {current}")
+            return None
+
+        response = httpx.get(current, timeout=30.0, follow_redirects=False)
+        if response.status_code not in _REDIRECT_STATUSES:
+            return response
+
+        location = response.headers.get("location", "")
+        if not location:
+            logger.error(f"Redirect without a location header: {current}")
+            return None
+        # Relative targets resolve against the hop we are on, then get vetted
+        # like any other.
+        current = urllib.parse.urljoin(current, location)
+
+    logger.error(f"Too many redirects while fetching: {url}")
+    return None
 
 
 def process_inbox() -> None:
@@ -251,12 +312,10 @@ def ingest_url(url: str, name: str) -> str | None:
     Returns:
         str | None: Path to the saved research file, or None.
     """
-    if not is_safe_url(url):
-        logger.error(f"URL fetch blocked by SSRF protection: {url}")
-        return None
-
     try:
-        response = httpx.get(url, timeout=30.0, follow_redirects=True)
+        response = _fetch_vetted_url(url)
+        if response is None:
+            return None
         response.raise_for_status()
         html = response.text
 

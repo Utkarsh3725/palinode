@@ -16,40 +16,45 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import pytest
-
 
 # loud-recoverable defaults --------------------------------------
 
 
-def test_load_config_warns_when_using_defaults(tmp_path, monkeypatch, caplog):
-    """`load_config()` must log a warning when no config file is found."""
-    # Point PALINODE_DIR somewhere empty so the env-based search misses too.
-    monkeypatch.setenv("PALINODE_DIR", str(tmp_path))
-    # Repo-root config is shipped — we can't suppress it here, so just
-    # check that, when both paths are searched and BOTH miss, we warn.
-    # Easier: just monkeypatch the search list.
+def _isolate_config_search(monkeypatch, tmp_path: Path) -> None:
+    """Make both config search paths miss, regardless of the checkout.
+
+    `load_config()` derives the repo-root candidate from the config module's
+    own `__file__` (two directories up), so chdir cannot hide a checkout's
+    `palinode.config.yaml`. Re-pointing `__file__` into `tmp_path` sends that
+    lookup to an empty tree; an empty PALINODE_DIR covers the other candidate.
+    """
+    fake_module = tmp_path / "fake-repo" / "palinode" / "core" / "config.py"
+    fake_module.parent.mkdir(parents=True)
     from palinode.core import config as cfg_mod
 
-    # Re-run load_config under a captured log handler.
+    monkeypatch.setattr(cfg_mod, "__file__", str(fake_module))
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    monkeypatch.setenv("PALINODE_DIR", str(memory_dir))
+
+
+def test_load_config_warns_when_using_defaults(tmp_path, monkeypatch, caplog):
+    """`load_config()` must log a warning when no config file is found."""
+    _isolate_config_search(monkeypatch, tmp_path)
+    from palinode.core import config as cfg_mod
+
     with caplog.at_level(logging.WARNING, logger="palinode.config"):
-        # We can't fully blank the search without filesystem manipulation,
-        # but on a tmp_path PALINODE_DIR with no config, loaded_path WOULD
-        # be None if no repo-root file existed. Detect the warning shape.
         cfg_mod.load_config()
 
-    # If a repo-root config was found we won't have warned — skip in that
-    # case (this is the working-tree-with-config case). The negative test
-    # below covers the loaded-from-file path.
-    warned = any(
-        "no palinode.config.yaml found" in rec.message for rec in caplog.records
-    )
-    if not warned:
-        pytest.skip(
-            "Repo-root palinode.config.yaml exists, so defaults were not "
-            "loaded. The warning path is exercised in test_load_config_"
-            "warning_message_lists_searched_paths via direct path override."
-        )
+    warned = [
+        rec.message for rec in caplog.records
+        if "no palinode.config.yaml found" in rec.message
+    ]
+    assert warned, "both search paths missed, so load_config must warn"
+    # The warning must name where it looked, so the user can self-recover.
+    assert "Searched:" in warned[0]
+    candidate = str(tmp_path / "memory" / "palinode.config.yaml")
+    assert candidate in warned[0], f"warning should list the PALINODE_DIR candidate {candidate}"
 
 
 def test_load_config_warning_message_lists_searched_paths(caplog, monkeypatch, tmp_path):
@@ -78,19 +83,18 @@ def test_load_config_warning_message_lists_searched_paths(caplog, monkeypatch, t
 
 def test_default_banner_label_is_loud(monkeypatch, capsys, tmp_path):
     """The stderr banner must clearly mark "defaults" — not just label it."""
-    monkeypatch.setenv("PALINODE_DIR", str(tmp_path))
+    _isolate_config_search(monkeypatch, tmp_path)
     from palinode.core import config as cfg_mod
 
     cfg_mod.load_config()
     captured = capsys.readouterr()
-    # When defaults are loaded, banner contains the warning prefix.
-    # When a file IS loaded (repo-root), banner contains a path.
-    # Either way, must NOT be the bare "defaults" string (regression).
-    if "defaults" in captured.err:
-        assert "⚠" in captured.err or "no config file" in captured.err, (
-            "When defaults are loaded, banner must be visibly marked. "
-            "Plain 'defaults' label is the #273 regression."
-        )
+    # Both search paths miss, so defaults are loaded and the banner must
+    # carry the visible marker — a bare "defaults" label is the regression.
+    assert "defaults" in captured.err
+    assert "⚠" in captured.err or "no config file" in captured.err, (
+        "When defaults are loaded, banner must be visibly marked. "
+        "Plain 'defaults' label is the #273 regression."
+    )
 
 
 # git-not-a-repo warning at API startup --------------------------

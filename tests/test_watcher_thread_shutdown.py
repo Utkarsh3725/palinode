@@ -3,7 +3,7 @@
 The CI signature was ``unit-tests`` aborting with exit 134 *after* the whole
 suite passed:
 
-    2109 passed, 1 skipped, 4 xfailed in 50.46s
+    ... passed, ... skipped, ... xfailed   (the full suite, green)
     ValueError: I/O operation on closed file.   (x several)
     Fatal Python error: _enter_buffered_busy: could not acquire lock for
       <_io.BufferedWriter name='<stderr>'> at interpreter shutdown,

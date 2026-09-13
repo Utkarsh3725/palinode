@@ -79,6 +79,9 @@ _ELISION_RE = re.compile(
 #: A ``fact_id`` shaped like an identifier. Anything else (a bracketed pseudo-id,
 #: a sentence of model deliberation) is unrecoverable garbage, not a stale id.
 _PLAUSIBLE_ID_RE = re.compile(r"^[A-Za-z0-9][\w.-]*$")
+#: A bare ``YYYY-MM-DD``, and the ``before <date>`` label a range op logs under.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RANGE_LABEL_RE = re.compile(r"^before \d{4}-\d{2}-\d{2}$")
 #: Canonical ``kind/slug`` entity reference (PROGRAM.md wiki-maintenance).
 _ENTITY_REF_RE = re.compile(r"^[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$")
 
@@ -129,6 +132,22 @@ def _format_label(resolved: list[str], total: int) -> str:
     return label
 
 
+def _range_label(op: dict) -> str | None:
+    """``before <date>`` for a well-formed range op, else ``None``.
+
+    ``ARCHIVE_BEFORE`` is the one operation that names no fact id — its
+    subject is a date, and the lines it retires are whichever ones fall before
+    it. Rendering :data:`UNRESOLVED` in the id slot would report the executor's
+    largest single retirement as unauditable, so the range takes the slot
+    instead. Recognised by :func:`_repair_log_line` as canonical, so the
+    repair pass leaves these lines alone.
+    """
+    if op_kind(op) != "ARCHIVE_BEFORE":
+        return None
+    before = str(op.get("before") or "").strip()
+    return f"before {before}" if _DATE_ONLY_RE.match(before) else None
+
+
 def render_log_lines(operations: list[Any], known_ids: set[str]) -> list[str]:
     """Render operations as ``- [KIND] id: rationale`` audit lines.
 
@@ -142,7 +161,9 @@ def render_log_lines(operations: list[Any], known_ids: set[str]) -> list[str]:
     * a ``KEEP`` with no rationale emits no line at all (it is a no-op with
       nothing to audit);
     * a ``fact_id`` absent from *known_ids* is replaced by :data:`UNRESOLVED` —
-      LLM free text never lands in the id slot.
+      LLM free text never lands in the id slot;
+    * an ``ARCHIVE_BEFORE`` names a date rather than an id, so its ``before``
+      date takes the id slot as ``before <date>`` (see :func:`_range_label`).
     """
     lines: list[str] = []
     for op in operations:
@@ -155,7 +176,8 @@ def render_log_lines(operations: list[Any], known_ids: set[str]) -> list[str]:
             continue
         ids = _op_fact_ids(op)
         resolved = [i for i in ids if i in known_ids]
-        lines.append(f"- [{kind}] {_format_label(resolved, len(ids))}: {reason}".rstrip())
+        label = _range_label(op) or _format_label(resolved, len(ids))
+        lines.append(f"- [{kind}] {label}: {reason}".rstrip())
     return lines
 
 
@@ -606,7 +628,7 @@ def _repair_log_line(line: str, known_ids: set[str]) -> tuple[str | None, bool]:
     reason = _clean_reason(reason)
     if kind == "KEEP" and not reason:
         return None, False
-    if raw_id == UNRESOLVED or raw_id in known_ids:
+    if raw_id == UNRESOLVED or _RANGE_LABEL_RE.match(raw_id) or raw_id in known_ids:
         return f"- [{kind}] {raw_id}: {reason}".rstrip(), False
     if not _PLAUSIBLE_ID_RE.match(raw_id):
         # Not a stale id — a bracketed pseudo-id or a paragraph of model

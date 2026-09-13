@@ -120,6 +120,23 @@ Environment variables the hooks respect:
 | `PALINODE_HOOK_RECALL_MIN_CHARS` | `12` | Prompts shorter than this skip recall entirely |
 | `PALINODE_HOOK_RECALL_MAX_CHARS` | `3000` | Total cap on per-turn injected context |
 | `PALINODE_HOOK_RECALL_TIMEOUT` | `4` | Per-request timeout (seconds) for the recall hook |
+| `PALINODE_HOOK_RESOLVE` | `1` | `0` routes the per-turn memory channel through plain `/search` instead of bounded resolution — the pre-resolution payload, byte for byte |
+| `PALINODE_HOOK_RESOLVE_DEADLINE` | `250` | Per-turn resolution deadline in **milliseconds**. A latency budget spent on every prompt, not a failure timeout: past it the turn falls back to search rather than waiting |
+
+### What the per-turn hook asks for
+
+The recall hook calls `POST /resolve` first, not `/search`: one call that
+returns what stands now, what replaced what, conflicts with both sides intact,
+and what is explicitly unknown — already rendered. Past the deadline it falls
+back to today's search hits **with a marker** (`resolution unavailable
+(deadline) …`), because an unchecked hit presented with the authority of a
+resolved answer is exactly what the resolution path exists to prevent.
+
+The bundle is asked for at the room actually left (`MAX_CHARS` minus the
+injection frame and any fired triggers), so the server can pack conflicts whole
+instead of having them sliced by the hook's final truncation. Below ~300
+characters of remaining room the channel injects nothing: silence is safe, half
+a conflict is not.
 
 ## Tuning the recall threshold
 

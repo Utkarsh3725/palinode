@@ -1,14 +1,18 @@
 from __future__ import annotations
 import logging
 import os
+from datetime import datetime
 from typing import Any, Iterable, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from palinode.core import store
 from palinode.core.config import config
-from palinode.core.parity import CATEGORIES, MEMORY_TYPES
+from palinode.core.parity import CATEGORIES, MEMORY_TYPES, TIERS
+from palinode.core.tiers import apply_tier
 from palinode.core.parser import VALID_EPISTEMICS, VALID_UPDATE_POLICIES
 from palinode.core.scope import ScopeChain
+from palinode.core.skip_dirs import is_skipped_path
+from palinode.core.expiry import core_has_expired
 from palinode.core.visibility import is_visible
 from palinode.api._util import (
     _auto_summary_state, _retrieval_logger, _safe_500, _utc_now,
@@ -26,12 +30,42 @@ from palinode.api.rate_limit import (
 # (`_srv.<name>`) inside generate_summaries_api so test monkeypatches on
 # palinode.api.server are honored — see that handler.
 from palinode.api.enrichment import _inject_description, _inject_summary
+from palinode.core import git_tools
 logger = logging.getLogger("palinode.api")
+
+#: Touched files per backfill commit. Small enough that a service restart
+#: mid-walk strands at most this many enrichments uncommitted; large enough
+#: that a 600-file backlog is a dozen commits, not six hundred.
+_BACKFILL_COMMIT_BATCH = 50
+
+
+def _backfill_commit_message(kinds: dict[str, int]) -> str:
+    """Provenance for one batch of enrichment writes.
+
+    ``git log`` on a memory file is how an operator learns *when* its
+    description or summary appeared and which release wrote it, so the
+    message counts each kind and carries the palinode version — the same
+    shape as ``prompt sync``'s commit.
+    """
+    from palinode import __version__
+
+    parts = []
+    if kinds.get("description"):
+        n = kinds["description"]
+        parts.append(f"{n} description{'s' if n != 1 else ''}")
+    if kinds.get("summary"):
+        n = kinds["summary"]
+        parts.append(f"{n} summar{'ies' if n != 1 else 'y'}")
+    return f"{config.git.commit_prefix} backfill: {', '.join(parts)} (palinode {__version__})"
 router = APIRouter()
 
 
 @router.get("/read")
-def read_api(file_path: str, meta: bool = False) -> dict[str, Any]:
+def read_api(
+    file_path: str,
+    meta: bool = False,
+    tier: Literal[*TIERS] | None = None,
+) -> dict[str, Any]:
     from palinode.core import parser
 
     candidates = [file_path]
@@ -61,14 +95,28 @@ def read_api(file_path: str, meta: bool = False) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="File not found")
 
     try:
-        result = {
-            "file": file_path,
-            "content": content,
-            "size_bytes": len(content.encode("utf-8")),
-        }
-
+        # `meta` keeps parse_markdown as its source so the frontmatter shape
+        # callers already depend on is untouched; the abstract tier only needs
+        # the raw frontmatter, so it uses the cheaper splitter when `meta` is
+        # off rather than paying for chunking.
+        metadata: dict[str, Any] | None = None
         if meta:
             metadata, _ = parser.parse_markdown(content)
+        elif tier == "abstract":
+            metadata, _ = parser.parse_frontmatter(content)
+
+        # `size_bytes` stays the size of the FILE, not of the tiered view —
+        # a caller asking for an abstract still wants to know what opening
+        # the full record would cost.
+        result = {
+            "file": file_path,
+            "content": apply_tier(tier, content, metadata),
+            "size_bytes": len(content.encode("utf-8")),
+        }
+        if tier is not None:
+            result["tier"] = tier
+
+        if meta:
             result["frontmatter"] = metadata
 
         # Issue emit retrieval event (explicit — direct /read call).
@@ -235,7 +283,18 @@ class SaveRequest(BaseModel):
     )
 
 
-_DEFAULT_LIST_SKIP_DIRS = frozenset({"daily", "archive", "inbox", "logs", "prompts"})
+# What the browse surface skips *in addition to* the never-memory directories
+# every surface skips (``palinode.core.skip_dirs.ALWAYS_SKIP``: specs, prompts,
+# logs, .palinode, .obsidian, .git). Episodic and retired memories are a browse
+# decision, not a universal one — the context digest reads ``inbox``.
+_DEFAULT_LIST_SKIP_DIRS = frozenset({"daily", "archive", "inbox"})
+
+
+def _iso_or_none(value: Any) -> str | None:
+    """Frontmatter ``expires_at`` as a JSON-safe string (YAML may yield a datetime)."""
+    if value is None or value == "":
+        return None
+    return value.isoformat() if isinstance(value, datetime) else str(value)
 
 
 def collect_memory_files(
@@ -268,9 +327,12 @@ def collect_memory_files(
     Frontmatter parsed here is passed to the choke point directly — it is
     live (just read from disk), so no second read is needed.
 
-    ``skip_dirs`` overrides the default top-level skip-dir set (``daily``,
-    ``archive``, ``inbox``, ``logs``, ``prompts``) — the provenance UI adds
-    ``.obsidian``. ``include_history`` controls whether ``-history.md``
+    ``skip_dirs`` replaces this surface's own skip dirs (``daily``,
+    ``archive``, ``inbox``); the never-memory directories in
+    :data:`palinode.core.skip_dirs.ALWAYS_SKIP` are skipped regardless of what
+    a caller passes, and are matched on every path segment — which is what
+    keeps the store's own prompts at ``specs/prompts/*.md`` out of every
+    listing. ``include_history`` controls whether ``-history.md``
     consolidation-audit siblings are included; the default (``True``)
     preserves the classic ``GET /list`` contract, and the UI passes ``False``
     since those siblings aren't browsable memories.
@@ -293,7 +355,7 @@ def collect_memory_files(
         rel_path = os.path.relpath(filepath, base_dir)
         parts = rel_path.split(os.sep)
 
-        if parts[0] in effective_skip_dirs:
+        if is_skipped_path(rel_path, effective_skip_dirs):
             continue
 
         if not include_history and parts[-1].endswith("-history.md"):
@@ -308,6 +370,11 @@ def collect_memory_files(
             metadata, _ = parser.parse_frontmatter(content)
 
             is_core = bool(metadata.get("core", False))
+            # An expired core memory stays listed and searchable but no
+            # longer acts: it is not core for injection purposes, so the
+            # session-start hook and the plugins (core_only=true) skip it.
+            if is_core and core_has_expired(rel_path, metadata):
+                is_core = False
             if core_only and not is_core:
                 continue
 
@@ -329,6 +396,8 @@ def collect_memory_files(
                 "category": metadata.get("category", parts[0]),
                 "core": is_core,
                 "scope": explicit_scope,
+                "expires_at": _iso_or_none(metadata.get("expires_at")),
+                "authority": metadata.get("authority"),
                 "summary": metadata.get("summary", ""),
                 "last_updated": metadata.get("last_updated", ""),
                 "entities": metadata.get("entities", []),
@@ -469,6 +538,37 @@ def generate_summaries_api() -> dict[str, Any]:
     desc_errors = 0
     last_error: str | None = None
     describe_enabled = config.auto_summary.enabled
+    # Provenance for what this walk writes. Each injector is a bare
+    # read-modify-write of frontmatter (through the guarded atomic primitive),
+    # so without this the deferred description lands on disk uncommitted and
+    # the store's tree drifts one file per slow save — 572 dirty files on the
+    # dogfood store before anyone looked. Batched: the walk can run for hours
+    # against a slow CHAT host, and a restart mid-walk must not strand
+    # everything written so far, so every _BACKFILL_COMMIT_BATCH touched files
+    # become one commit and the remainder is committed at the end.
+    touched: list[str] = []
+    touched_kinds: dict[str, int] = {"description": 0, "summary": 0}
+    commits = 0
+    files_committed = 0
+
+    def _flush_commits() -> None:
+        nonlocal commits, files_committed
+        if not touched:
+            return
+        message = _backfill_commit_message(touched_kinds)
+        if git_tools.commit_memory_files(list(touched), message):
+            commits += 1
+            files_committed += len(touched)
+        touched.clear()
+        touched_kinds["description"] = 0
+        touched_kinds["summary"] = 0
+
+    def _touched(filepath: str, kind: str) -> None:
+        if filepath not in touched:
+            touched.append(filepath)
+        touched_kinds[kind] += 1
+        if len(touched) >= _BACKFILL_COMMIT_BATCH:
+            _flush_commits()
     # reset the CHAT-fallback budget for this backfill run. Bounds how many
     # deferred files may escalate to the OpenAI-compat shim in a single walk so a
     # chronically-down local chat host can't fan the whole backlog out to
@@ -509,6 +609,7 @@ def generate_summaries_api() -> dict[str, Any]:
                     last_error = f"description deferred (ollama slow) for {os.path.basename(filepath)}"
                 elif desc:
                     _inject_description(filepath, desc)
+                    _touched(filepath, "description")
                     desc_count += 1
                     logger.info(f"Generated description for {filepath}")
                 else:
@@ -523,6 +624,7 @@ def generate_summaries_api() -> dict[str, Any]:
             summary = _srv._generate_summary(content)
             if summary:
                 _inject_summary(filepath, summary)
+                _touched(filepath, "summary")
                 count += 1
                 logger.info(f"Generated summary for {filepath}")
             else:
@@ -534,6 +636,8 @@ def generate_summaries_api() -> dict[str, Any]:
             errors += 1
             last_error = f"{type(e).__name__}: {e}"[:200]
             logger.warning(f"Enrichment generation failed for {filepath}: {e}")
+
+    _flush_commits()
 
     duration_ms = int((_time.monotonic() - started) * 1000)
     _auto_summary_state["last_run_at"] = _utc_now().isoformat().replace("+00:00", "Z")
@@ -553,5 +657,7 @@ def generate_summaries_api() -> dict[str, Any]:
         "errors": errors,
         "descriptions_generated": desc_count,
         "description_errors": desc_errors,
+        "commits": commits,
+        "files_committed": files_committed,
         "duration_ms": duration_ms,
     }

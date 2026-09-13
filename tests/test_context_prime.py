@@ -31,6 +31,14 @@ DIGEST_KEYS = {
     "_palinode_hint",
     "mode",
     "scope_chain",
+    # The delivery receipt for this digest — which records, at which exact
+    # revisions, this session was primed with (palinode.core.receipt).
+    "receipt",
+    # Present whenever an injection budget is configured (it is, by default):
+    # what the payload cost and what the budget withheld. A digest built with
+    # both caps at 0 carries neither this nor `_contested_partial`; see
+    # tests/test_context_prime_budget.py.
+    "_budget",
 }
 
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current version:** 0.10.x · **Status:** usable, actively developed, pre-1.0
+**Current version:** 0.15.x · **Status:** usable, actively developed, pre-1.0
 **Last reviewed:** August 2026
 
 This is a direction document, not a delivery schedule. Palinode has one maintainer,
@@ -28,8 +28,7 @@ Concretely, that means a memory record can carry:
   here is the hash proving the words have not changed
 - a **git commit** recording who wrote it and when, so it can be diffed and reverted
 
-…and that the model **never writes any of it directly**. It proposes operations; a
-deterministic executor validates and applies them.
+Memory changes are validated, recorded in git, and available for review or rollback.
 
 Being the *reference* implementation is the goal, not a consolation prize. Palinode is
 not trying to out-scale hosted memory services or win on install base. It is trying to
@@ -42,12 +41,14 @@ adopted — including by other systems.
 
 Work in progress or next up.
 
-**External benchmark evidence.** Palinode's differentiating behaviours — contradiction
-resolution, abstention, temporal reasoning — have historically had no external
-scoreboard, because the widely used memory benchmarks do not test them. That is
-changing, and running against a benchmark that *does* test them is the current
-priority. Results will be published with methodology and with the cases Palinode loses,
-not just the ones it wins.
+**External benchmark evidence.** First results are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md): on LongMemEval_S the memory layer puts the
+answer-bearing session in the top-10 for 98 % of questions, and the same memory scores
+0.48 → 0.88 depending only on the reader — published with methodology, cost, judge
+agreement, and the question types Palinode loses. Next: confidence intervals over several
+seeds, a tiered-read row for token cost, and a benchmark that tests the differentiating
+behaviours — contradiction resolution, abstention, temporal reasoning — which the widely
+used memory benchmarks still largely do not.
 
 **Interoperability of the record format.** The epistemic status, evidence links, and
 citation structure are currently expressed as Palinode's frontmatter schema. They are

@@ -33,6 +33,15 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 #: Add a verb here when the README starts telling people to type it.
 DOCUMENTED_IN_PROSE = ("dream",)
 
+#: A skip here would let a README edit that drops the verb turn the test green
+#: silently. Failing forces the change to be deliberate: either restore the
+#: sentence, or remove the verb from DOCUMENTED_IN_PROSE in the same change.
+_NOT_DOCUMENTED = (
+    "README no longer documents `palinode {verb}` in prose. If the command "
+    "was removed on purpose, remove it from DOCUMENTED_IN_PROSE in this test "
+    "deliberately; otherwise restore the README sentence."
+)
+
 
 def _registered_commands() -> set[str]:
     """Every command name the CLI actually exposes, aliases included."""
@@ -52,8 +61,7 @@ def _readme_text() -> str:
 def test_readme_command_is_registered(verb: str) -> None:
     """If the README says ``palinode <verb>``, the CLI must answer to it."""
     mentioned = re.search(rf"`palinode {re.escape(verb)}`", _readme_text())
-    if not mentioned:
-        pytest.skip(f"README does not currently document `palinode {verb}`")
+    assert mentioned, _NOT_DOCUMENTED.format(verb=verb)
 
     assert verb in _registered_commands(), (
         f"README documents `palinode {verb}` but the CLI has no such command. "
@@ -70,8 +78,9 @@ def test_documented_command_actually_runs(verb: str) -> None:
     Cheap end-to-end check that the alias is wired to a real callback rather
     than registered as a name with nothing behind it.
     """
-    if not re.search(rf"`palinode {re.escape(verb)}`", _readme_text()):
-        pytest.skip(f"README does not currently document `palinode {verb}`")
+    assert re.search(rf"`palinode {re.escape(verb)}`", _readme_text()), (
+        _NOT_DOCUMENTED.format(verb=verb)
+    )
 
     result = CliRunner().invoke(cli_root, [verb, "--help"])
     assert result.exit_code == 0, (

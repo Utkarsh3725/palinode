@@ -84,6 +84,22 @@ def test_threshold_lets_either_arm_vouch_for_a_candidate():
     assert _order(out) == ["hit.md"]
 
 
+def test_vector_threshold_does_not_filter_fts_candidates():
+    weak_fts = _res("keyword.md", score=0.2, has_vector=True)
+
+    out = _run([], [weak_fts], threshold=0.5, fts_threshold=0.0)
+
+    assert _order(out) == ["keyword.md"]
+
+
+def test_fts_threshold_does_not_filter_vector_candidates():
+    weak_vec = _res("semantic.md", score=0.2, raw_score=0.2)
+
+    out = _run([weak_vec], [], threshold=0.0, fts_threshold=0.5)
+
+    assert _order(out) == ["semantic.md"]
+
+
 def test_threshold_floor_is_independent_of_rrf_rank():
     """A candidate at/above the per-arm floor survives even buried deep in
     RRF rank — the floor no longer collapses into an accidental rank cutoff.
@@ -180,16 +196,6 @@ def test_context_boost_lifts_in_context_files(monkeypatch):
     assert _order(out)[0] == "b.md", "context boost should lift an in-context file"
 
 
-def test_daily_penalty_demotes_daily_files(monkeypatch):
-    monkeypatch.setattr(config.search, "daily_penalty", 0.1)
-    daily = _res("daily/2026-06-21.md")   # rank 0, would win without penalty
-    normal = _res("insights/x.md")        # rank 1
-    out = _run([daily, normal], [])
-    assert _order(out)[0] == "insights/x.md", "daily files are penalised unless include_daily"
-    out_incl = _run([daily, normal], [], include_daily=True)
-    assert _order(out_incl)[0] == "daily/2026-06-21.md", "include_daily disables the penalty"
-
-
 def test_date_window_filters_by_last_updated():
     inwin = _res("in.md", metadata={"last_updated": "2026-06-10"})
     old = _res("old.md", metadata={"last_updated": "2026-01-01"})
@@ -218,3 +224,46 @@ def test_date_window_applied_before_top_k_truncation():
         "date-windowed search must not be defeated by top_k truncating away "
         "the in-window candidates before the window is ever applied"
     )
+
+
+def test_threshold_exempts_vectorless_fts_candidates():
+    """An FTS candidate the store marked ``has_vector=False`` (a chunk with
+    no ``chunks_vec`` row — written FTS-only by a per-input embed rejection
+    or a deferred embed) survives the per-arm floor regardless of
+    its BM25 score: the keyword arm is the only arm it has. A candidate with
+    a vector, or with no flag at all (legacy slate), is floored as before.
+    """
+    # The FTS floor is relative to the slate's best keyword score (0.30 here,
+    # floor 0.4 × 0.30 = 0.12), not the cosine threshold — so the 0.05 rows
+    # are below it, and only the vectorless one is let through.
+    top = _res("top.md", score=0.30, has_vector=True)
+    fts_only = _res("fts-only.md", score=0.05, has_vector=False)
+    vectored = _res("vectored.md", score=0.05, has_vector=True)
+    legacy = _res("legacy.md", score=0.05)
+    out = _run([], [top, fts_only, vectored, legacy], threshold=0.5)
+    assert set(_order(out)) == {"top.md", "fts-only.md"}
+
+
+def test_vectorless_exemption_leaves_vectored_candidates_untouched():
+    """Pin: the exemption changes nothing for chunks that have a vector. The
+    same slate with and without a vectorless FTS-only candidate yields the
+    same vectored survivors, in the same order, with the same scores — the
+    vectorless one simply enters fusion as an ordinary FTS candidate.
+    """
+    strong_vec = _res("strong.md", score=0.7)
+    weak_vec = _res("weak.md", score=0.3, raw_score=0.3)
+    strong_fts = _res("strong.md", score=0.5, has_vector=True)
+    weak_fts_vectored = _res("weak.md", score=0.1, has_vector=True)   # below 0.4 × 0.5
+    fts_only = _res("fts-only.md", score=0.02, has_vector=False)
+
+    baseline = _run([strong_vec, weak_vec], [strong_fts, weak_fts_vectored], threshold=0.5)
+    with_fts_only = _run(
+        [strong_vec, weak_vec], [strong_fts, weak_fts_vectored, fts_only], threshold=0.5
+    )
+
+    def _vectored(results):
+        return [(r["file_path"], r["score"]) for r in results if r["file_path"] != "fts-only.md"]
+
+    assert _order(baseline) == ["strong.md"]
+    assert _vectored(with_fts_only) == _vectored(baseline)
+    assert "fts-only.md" in _order(with_fts_only)

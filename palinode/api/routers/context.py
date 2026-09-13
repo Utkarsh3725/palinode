@@ -72,14 +72,23 @@ def context_prime_api(req: PrimeRequest) -> dict[str, Any]:
     """Session-start context digest for the resolved scope.
 
     Returns ``{project, core_memories, recent_decisions, open_action_items,
-    recent_snapshots, _palinode_hint, mode, scope_chain}`` — the bounded
-    ADR-012 digest (built
+    recent_snapshots, _palinode_hint, mode, scope_chain, receipt}`` — the
+    bounded ADR-012 digest (built
     from frontmatter reads only; no embeds, no LLM), plus the resolved scope
     chain. Project-scoped rows are returned only when a project actually
     resolves; with neither a usable ``cwd`` nor a ``project``, the digest
     degrades to core memories only and never guesses a scope.
+
+    ``receipt`` is the delivery receipt for the digest
+    (:mod:`palinode.core.receipt`, public view): every supplied ref at the
+    exact revision it was supplied at, its disposition, the known origin
+    lineage, the resolved scope and policy, the evaluation time and the next
+    known temporal transition among the delivered records. No retrieval-log
+    rows are written for a prime: a session-start injection ledger is a
+    separate contract, and this endpoint has never written to that log.
     """
     from palinode.core.context_prime import build_context_digest, resolve_project
+    from palinode.core.receipt import build_digest_receipt
 
     configured = config.scope.prime_mode
     if configured not in _PRIME_MODES:
@@ -115,4 +124,18 @@ def context_prime_api(req: PrimeRequest) -> dict[str, Any]:
         chain.as_list(),
         len(digest.get("core_memories", [])),
     )
-    return {**digest, "mode": mode, "scope_chain": chain.as_list()}
+    receipt = build_digest_receipt(
+        digest,
+        # The request as it decides selection — ``session_id`` is telemetry and
+        # is excluded by the receipt's own normalization.
+        request={"surface": "context_prime", "cwd": req.cwd,
+                 "project": project_arg, "mode": mode},
+        scope=chain.as_list(),
+        memory_dir=config.memory_dir,
+    )
+    return {
+        **digest,
+        "mode": mode,
+        "scope_chain": chain.as_list(),
+        "receipt": receipt.public(),
+    }

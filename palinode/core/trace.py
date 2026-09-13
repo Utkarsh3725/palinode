@@ -10,7 +10,10 @@ the net-new code here is the join + honest presentation over
 - git blame / history — :mod:`palinode.core.git_tools`;
 - the supersession trail — the executor's ``<base>-history.md`` sibling plus the
   in-body ``[superseded]`` / ``[retracted]`` tombstones;
-- the retrieval log — ``.audit/retrievals.jsonl``.
+- the retrieval log — ``.audit/retrievals.jsonl``, whose rows carry the
+  delivery receipt (:mod:`palinode.core.receipt`) they were written under, so
+  ``recalled`` reports not only *that* a file was recalled but in which
+  deliveries, at which source revisions, and under which disposition.
 
 Each row carries an honest three-state ``status`` so the trail never overclaims:
 
@@ -235,10 +238,16 @@ def _recalled_section(rel_path: str, memory_dir: str) -> dict[str, Any]:
             "sessions": [],
             "dates": [],
             "last": None,
+            "bundles": [],
+            "dispositions": {},
+            "revisions": [],
         }
     sessions: list[str] = []
     dates: list[str] = []
     timestamps: list[str] = []
+    bundles: list[str] = []
+    dispositions: dict[str, int] = {}
+    revisions: list[str] = []
     for event in events:
         sid = event.get("session_id")
         if sid and sid not in sessions:
@@ -249,12 +258,30 @@ def _recalled_section(rel_path: str, memory_dir: str) -> dict[str, Any]:
             day = ts[:10]
             if day not in dates:
                 dates.append(day)
+        # Delivery-receipt fields (present only on rows written by a delivery
+        # that built one; older rows simply carry none).
+        bundle = event.get("bundle_id")
+        if bundle and str(bundle) not in bundles:
+            bundles.append(str(bundle))
+        disposition = event.get("disposition")
+        if disposition:
+            dispositions[str(disposition)] = dispositions.get(str(disposition), 0) + 1
+        revision = event.get("revision")
+        if revision and str(revision) not in revisions:
+            revisions.append(str(revision))
     return {
         "status": STATUS_PRESENT,
         "count": len(events),
         "sessions": sessions,
         "dates": dates,
         "last": max(timestamps) if timestamps else None,
+        #: The deliveries this file was supplied in, the dispositions it was
+        #: supplied under, and the distinct source revisions it was supplied
+        #: at — the receipt half of the retrieval log (see
+        #: :mod:`palinode.core.receipt`).
+        "bundles": bundles,
+        "dispositions": dispositions,
+        "revisions": revisions,
     }
 
 
@@ -400,6 +427,14 @@ def _fmt_recalled(recalled: dict[str, Any]) -> str:
         line += f" · dates: {', '.join(recalled['dates'])}"
     if recalled.get("last"):
         line += f" · last {str(recalled['last'])[:10]}"
+    dispositions = recalled.get("dispositions") or {}
+    if dispositions:
+        line += " · supplied as " + ", ".join(
+            f"{name}×{count}" for name, count in sorted(dispositions.items())
+        )
+    revisions = recalled.get("revisions") or []
+    if revisions:
+        line += f" · {len(revisions)} revision(s)"
     return line
 
 

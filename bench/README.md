@@ -55,6 +55,99 @@ The pinned query shapes are natural-language questions, short keywords, absent i
 exact-topic controls, and natural-language paraphrase controls. Each false-positive observation
 records both the fused score exposed to callers and the underlying raw cosine when available.
 
+## Current-state recall — from memory transitions to agent decisions
+
+`current_state/` measures the thing retrieval scores cannot: after a record is
+replaced, retracted, archived, consolidated or expired, does the delivered
+context let an agent act correctly? Four stages are scored **separately**, so a
+wrong answer is attributed rather than counted:
+
+1. **Detection** — did the arm surface the correction or the conflicting record?
+2. **Disposition** — current / contested / unknown, decided correctly?
+3. **Presentation** — did the text keep a retired value out of the current slot,
+   keep both sides of a conflict, and carry the qualifiers?
+4. **Behavior** — did a reader consuming only that text choose right, or abstain?
+
+```bash
+python -m bench.current_state --full --out results.json --report report.md
+python -m bench.current_state --slice 10              # the bounded CI shape
+python -m bench.current_state --coverage-only         # just the family gate
+python -m bench.current_state --require-coverage ...  # gate → exit code
+```
+
+**The corpus** (`episodes.yaml`, versioned) is an event stream, not a Q&A set:
+each episode is a sequence of saves, explicit replacements, retractions,
+archives, consolidation passes, clock advances, delayed imports and restores,
+followed by questions with a **deterministic oracle** — the expected
+disposition, the expected value, the retired values that must never appear as
+current, and the evidence refs. Every family carries a positive control (the
+transition happened) and a negative one (nothing changed), and the coverage
+gate fails if either side of any family disappears. A held-out split is derived
+at load time by substituting unseen project names and paraphrasing the
+questions under a fixed seed.
+
+Nothing is simulated. Episodes replay through the real `index_file` pipeline,
+the real archive/retract operations, the real deterministic executor and the
+real consolidation runner — only the runner's proposal seam is replaced, with a
+constant, so the corpus contains no model output.
+
+**The arms** all answer the same questions against the same store from the same
+seed retrieval, under one token accounting (`packing.estimate_tokens`):
+
+| Arm | What it delivers |
+|---|---|
+| `baseline` | Top-k hits rendered from the **raw file** — pre-projection semantics. |
+| `projection` | The same hits rendered from the indexed current-text projection. |
+| `bounded_evidence` | Bounded evidence around each hit plus the resolution policy. |
+| `bundle` | The whole bounded-resolution operation under the per-turn budget. |
+| `matched_budget` | `baseline` with top-k raised until it costs what the bundle cost. |
+
+Two more controls: **raw-evidence retention versus consolidation** (matched
+episodes, one arm never consolidates) and **repeated consolidation** (three
+cycles plus a delayed import and an explicit restore).
+
+**The reader** is a rule-following program, not a model — pick the value marked
+current; if contested, abstain and list the sides; if unknown, abstain — so
+"agent behavior" is a measured number. Unmarked hits have no markers to follow,
+so the reader does what an agent does with a ranked list and takes the top hit,
+which is how an unmarked arm scores a stale-current answer at all. A
+model-backed reader exists behind `--llm-reader`, off by default; it reads its
+endpoint and model from `PALINODE_BENCH_LLM_URL` / `PALINODE_BENCH_LLM_MODEL`
+(no host is compiled in), runs over a family-stratified sample, and reports
+**no number at all** if any scored family had zero coverage.
+
+**Hard invariants**, asserted rather than scored: no read arm moves `HEAD` or
+dirties the tree; no delivery carries a hidden record's title or content; no
+mechanical case presents a retired value as current; and every store, rebuilt
+from its files alone with the index deleted, re-derives the same delivery at
+the same source revisions with a receipt that names them.
+
+**Release fixtures** run the *actual* shipped `UserPromptSubmit` hook script
+against a live API server on an ephemeral port, so what the reader sees is what
+a session would have been handed.
+
+```bash
+python -m pytest tests/test_bench_current_state.py -q          # bounded slice
+python -m pytest tests/test_bench_current_state.py -q -m slow  # the full corpus
+```
+
+## Operating-numbers sweep
+
+`perf.py` measures what `docs/PERFORMANCE.md` publishes: search latency p50/p95,
+index throughput, RAM and disk across chunk-count targets.
+
+```bash
+python -m bench.perf --sizes 1000,10000,50000 \
+  --label "your box, stated plainly" --synthetic-vectors --markdown
+```
+
+`--synthetic-vectors` swaps the embedder for deterministic hash vectors. The write
+path, the vector table and the search path stay real, so latency and throughput are
+valid; only vector *content* is fake, so **recall quality is not measured** and the
+module never reports one. Omit the flag to run against a real embedder — the rig
+refuses rather than silently degrading if none is reachable, and aborts if any scale
+point indexes zero vectors.
+
 ## Layout
 
 | File | Purpose |
@@ -64,10 +157,13 @@ records both the fused score exposed to callers and the underlying raw cosine wh
 | `run.py` | End-to-end orchestrator (the four axes) + CLI. |
 | `report.py` | Renders a results JSON object as a Markdown report. |
 | `abstention.py` | Standalone no-answer/control threshold sweep + JSON/Markdown output. |
+| `current_state/` | Current-state recall: event corpus, five arms, deterministic reader, invariants. |
+| `perf.py` | Scale sweep behind `docs/PERFORMANCE.md` — latency, throughput, RAM, disk at 1k/10k/50k chunks. |
 
 ## Tests
 
 ```bash
 python -m pytest tests/test_bench_harness.py -q
 python -m pytest tests/test_bench_abstention.py -q
+python -m pytest tests/test_bench_perf.py -q
 ```

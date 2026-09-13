@@ -20,6 +20,7 @@ import urllib.request
 
 from palinode.core import store, parser, embedder, cross_refs  # noqa: F401  (embedder re-exported for test patches)
 from palinode.core.config import config
+from palinode.core.skip_dirs import is_skipped_path
 from palinode.indexer.index_file import index_file
 import json
 from datetime import UTC, datetime
@@ -257,6 +258,20 @@ schedules summary and description generation."""
     def is_valid_file(self, path: str) -> bool:
         """Return True if *path* is a Markdown file outside ignored directories.
 
+        Two filters. The first is the shared non-memory directory set
+        (:data:`palinode.core.skip_dirs.ALWAYS_SKIP`), matched on every segment
+        of the path *relative to the store root* — so the store's own editable
+        consolidation prompts at ``specs/prompts/*.md`` stay out of the index,
+        and a store that itself lives under a directory named ``specs`` still
+        indexes normally. Nothing reads prompts through the index (every
+        consumer globs them off disk), so indexing them only put prompt text
+        into recall. A ``palinode reindex`` drops chunks already there: the
+        reindex walk filters through this predicate and its GC pass removes
+        every indexed path the walk no longer yields.
+
+        The second is the historical substring list below: database sidecars,
+        virtualenvs, build noise, and processed inbox items.
+
         Args:
             path (str): Path to check.
 
@@ -265,7 +280,14 @@ schedules summary and description generation."""
         """
         if not path.endswith('.md'):
             return False
-            
+
+        try:
+            rel = os.path.relpath(path, config.palinode_dir)
+        except ValueError:  # different drive on Windows — not under the store
+            rel = ""
+        if rel and not rel.startswith(os.pardir + os.sep) and is_skipped_path(rel):
+            return False
+
         ignore_patterns = [
             '/.git/', '/logs/', '/.palinode.db', '/venv/', 
             '/node_modules/', '/__pycache__/', '/palinode.egg-info/', 

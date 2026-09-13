@@ -1,36 +1,30 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import glob
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import frontmatter as _frontmatter
 
 from palinode.core.config import config
 from palinode.core import parser
+from palinode.core import revalidation
+from palinode.core import typed_links
+from palinode.core.packing import estimate_tokens
+from palinode.core.relative_dates import anchor_for, find_relative_dates
+
+#: What to do about a `core: true` memory that has grown past a gist. Carried
+#: on every finding so the instruction reaches whichever surface renders it.
+CORE_GIST_REMEDIATION = "core = gist + pointer; move detail to the full file"
 
 # Marker written by Deliverable C (palinode_save auto-footer plumbing).
 # Wikilinks that appear under this marker count as satisfying the entity
 # requirement — the auto-footer is a derived view of ``entities:`` and
 # deliberately links every frontmatter entity that has no inline body link.
 _AUTO_FOOTER_MARKER = "<!-- palinode-auto-footer -->"
-
-_RELATIVE_DATE_NUMBER = (
-    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
-)
-_RELATIVE_DATE_RE = re.compile(
-    rf"(?<!\w)(?:"
-    rf"{_RELATIVE_DATE_NUMBER} (?:days|weeks|months|years) ago|"
-    r"last (?:week|month|year)|"
-    r"next (?:week|month|year)|"
-    r"this (?:week|month)|"
-    r"right now|these days|"
-    r"yesterday|today|tomorrow|recently|lately|currently"
-    r")(?!\w)",
-    re.IGNORECASE,
-)
 
 def _alias_key(name: str) -> str:
     """Separator-and-case-insensitive form of an entity ref's name part.
@@ -370,15 +364,23 @@ def check_wiki_drift(
     return warnings
 
 
-def check_relative_dates(body: str) -> list[dict[str, str]]:
-    """Return relative time expressions whose meaning will drift over time."""
-    findings: list[dict[str, str]] = []
-    for line_number, line in enumerate(body.splitlines(), start=1):
-        findings.extend(
-            {"line": str(line_number), "expression": match.group(0)}
-            for match in _RELATIVE_DATE_RE.finditer(line)
-        )
-    return findings
+def check_relative_dates(body: str, anchor: date | None = None) -> list[dict[str, str]]:
+    """Relative time expressions whose meaning will drift, with their fix.
+
+    Each finding carries ``line``, ``expression``, the ``anchor`` the memory is
+    dated by, and ``resolved`` — the absolute date the phrase means, or
+    ``"unresolvable"`` with a ``reason``. The resolution is what makes the
+    finding actionable rather than merely annoying: it is exactly the
+    replacement text ``palinode lint --propose`` turns into an ``UPDATE``.
+
+    Detection is deliberately wider than rewriting. A relative date inside a
+    quotation is reported here and refused by the normaliser — see
+    :mod:`palinode.core.relative_dates`.
+    """
+    return [
+        found.as_finding(anchor)
+        for found in find_relative_dates(body, anchor)
+    ]
 
 
 def run_lint_pass() -> dict[str, Any]:
@@ -393,6 +395,7 @@ def run_lint_pass() -> dict[str, Any]:
     missing_entities: list[str] = []
     missing_descriptions: list[str] = []
     missing_priority: list[str] = []
+    missing_expiry: list[str] = []
     wiki_drift: list[dict[str, Any]] = []
     relative_dates: list[dict[str, Any]] = []
     source_anchor_issues: list[dict[str, Any]] = []
@@ -402,6 +405,14 @@ def run_lint_pass() -> dict[str, Any]:
     # or supersession. Reuses the stale threshold (90 days).
     stale_open_questions: list[dict[str, Any]] = []
     open_contradictions: list[dict[str, Any]] = []  # (G4)
+    # A `backed_by` source that was superseded / retracted / archived / merged
+    # away leaves a `stale_backing` entry on each dependent; the memory is
+    # still live but its support was withdrawn, so it wants a second look.
+    stale_backing: list[dict[str, Any]] = []
+    # A `core: true` memory is injected at every session start, so it is the
+    # one tier whose size is spent whether or not anyone wanted it. Past
+    # `context.core_gist_max_chars` it has stopped being an index entry.
+    oversized_core: list[dict[str, Any]] = []
     core_count = 0
 
     now = datetime.now(timezone.utc)
@@ -437,14 +448,34 @@ def run_lint_pass() -> dict[str, Any]:
                 "path": rel_path,
                 "metadata": metadata,
                 "body": body_text,
+                # The whole-file revision (``file_sha256``), computed from the
+                # bytes already in hand: what a revalidation receipt names, so
+                # the support pass below can compare without a second read.
+                "revision": hashlib.sha256(content.encode()).hexdigest(),
             })
         except Exception:
             pass
 
+    # The reader the support pass (10) checks backing through: the files this
+    # scan already read, falling back to disk for the ones it skipped —
+    # `archive/` above all, where a source retired *by location* lives and
+    # where the map would otherwise report it merely missing.
+    _scanned = {
+        revalidation.normalize_ref(f["path"]): (
+            f["metadata"], f.get("revision"), f["path"].replace(os.sep, "/")
+        )
+        for f in all_files
+    }
+    _from_scan = revalidation.mapping_reader(_scanned, now=now)
+    _from_disk = revalidation.disk_reader(base_dir, now=now)
+
+    def _support_read(ref: str) -> revalidation.SourceView | None:
+        return _from_scan(ref) or _from_disk(ref)
+
     for f in all_files:
         path = f["path"]
         meta = f["metadata"]
-        
+
         # 1. Missing fields — memory files only.
         #
         # `daily/` notes are the structural log tier, not a memory tier: they
@@ -496,6 +527,24 @@ def run_lint_pass() -> dict[str, Any]:
         # 5. Core count
         if meta.get("core"):
             core_count += 1
+            # Acting state should carry an expiry (palinode.core.expiry): a
+            # core memory with no `expires_at` acts under its original grant
+            # forever. Advisory — nothing is disabled here.
+            if not meta.get("expires_at"):
+                missing_expiry.append(path)
+            # Gist discipline: core carries the gist and the pointer; the
+            # detail lives in the file the pointer names. Measured on the body
+            # in the same units the injection budget uses.
+            gist_limit = config.context.core_gist_max_chars
+            body_chars = len(f.get("body", "").strip())
+            if gist_limit > 0 and body_chars > gist_limit:
+                oversized_core.append({
+                    "file": path,
+                    "chars": body_chars,
+                    "tokens": estimate_tokens(f.get("body", "").strip()),
+                    "limit": gist_limit,
+                    "remediation": CORE_GIST_REMEDIATION,
+                })
 
         # 6. Missing human priority on core and decision memories.
         if (meta.get("core") is True or meta.get("type") == "Decision") and "priority" not in meta:
@@ -505,19 +554,22 @@ def run_lint_pass() -> dict[str, Any]:
         if meta.get("status") == "active":
             last_updated = meta.get("last_updated") or meta.get("created_at")
             if last_updated:
-                try:
-                    if isinstance(last_updated, str):
+                if isinstance(last_updated, str):
+                    try:
                         dt = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
-                    else:
-                        dt = last_updated
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        dt = None  # malformed date string — skip this file
+                elif isinstance(last_updated, datetime):
+                    dt = last_updated
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = None  # frontmatter held something that is not a date
 
+                if dt is not None:
                     days_old = (now - dt).days
                     if days_old > 90:
                         stale_files.append({"file": path, "days_old": days_old})
-                except Exception:
-                    pass
 
         # 6b. Stale open questions — an unresolved open_question that's
         # months old wants attention. Independent of `status` (an open question
@@ -526,18 +578,22 @@ def run_lint_pass() -> dict[str, Any]:
         if meta.get("epistemic") == "open_question":
             oq_updated = meta.get("last_updated") or meta.get("created_at")
             if oq_updated:
-                try:
-                    if isinstance(oq_updated, str):
+                if isinstance(oq_updated, str):
+                    try:
                         oq_dt = datetime.fromisoformat(oq_updated.replace('Z', '+00:00'))
-                    else:
-                        oq_dt = oq_updated
-                        if oq_dt.tzinfo is None:
-                            oq_dt = oq_dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        oq_dt = None  # malformed date string — skip this file
+                elif isinstance(oq_updated, datetime):
+                    oq_dt = oq_updated
+                    if oq_dt.tzinfo is None:
+                        oq_dt = oq_dt.replace(tzinfo=timezone.utc)
+                else:
+                    oq_dt = None  # frontmatter held something that is not a date
+
+                if oq_dt is not None:
                     oq_age = (now - oq_dt).days
                     if oq_age > 90:
                         stale_open_questions.append({"file": path, "days_old": oq_age})
-                except Exception:
-                    pass
 
         # 7. Wiki drift — frontmatter entities vs. body wikilinks.
         # Skipped for daily/ logs, the second outlier found in this pass: they
@@ -552,7 +608,9 @@ def run_lint_pass() -> dict[str, Any]:
             if drift_warnings:
                 wiki_drift.append({"file": path, "warnings": drift_warnings})
 
-            relative_date_matches = check_relative_dates(body)
+            relative_date_matches = check_relative_dates(
+                body, anchor_for(meta, path)
+            )
             if relative_date_matches:
                 relative_dates.append({"file": path, "matches": relative_date_matches})
 
@@ -614,6 +672,40 @@ def run_lint_pass() -> dict[str, Any]:
         if _contradicts:
             open_contradictions.append({"file": path, "contradicts": _contradicts})
 
+        # 10. Stale backing — the dependent side of `backed_by` propagation,
+        # plus the read-time support check over the same record.
+        #
+        # The persisted half is what a retirement wrote and is reported until
+        # the memory is re-saved (which rebuilds its frontmatter and so clears
+        # the flag). The live half re-derives support from current state
+        # (`palinode.core.revalidation`): a source retired since the last pass,
+        # a second-hop source propagation never walked, or a source whose
+        # revision no longer matches the one this record recorded as
+        # revalidated. Findings for a ref the record is already flagged for add
+        # nothing — the entry is already there. Archived dependents assert
+        # nothing in recall and are not reported either way.
+        from palinode.consolidation.propagate import parse_stale_backing
+        _stale = parse_stale_backing(meta)
+        if meta.get("status") != "archived":
+            _check = None
+            _found: list[dict[str, Any]] = []
+            if typed_links.parse_link_refs(meta, "backed_by"):
+                _check = revalidation.check_support(
+                    revalidation.normalize_ref(path), meta,
+                    read=_support_read, now=now, revision=f.get("revision"),
+                )
+                _found = revalidation.new_stale_entries(meta, _check, at=now)
+            if _stale or _found:
+                finding: dict[str, Any] = {
+                    "file": path,
+                    # Persisted first, then what the live check adds: an
+                    # existing consumer reads this list unchanged.
+                    "stale_backing": [*_stale, *_found],
+                }
+                if _check is not None:
+                    finding["support"] = _check.to_dict()
+                stale_backing.append(finding)
+
     # 4. Contradictions heuristics
     # Simple check: Any entity that has multiple active files
     file_statuses = {}
@@ -655,12 +747,15 @@ def run_lint_pass() -> dict[str, Any]:
         "missing_entities": missing_entities,
         "missing_descriptions": missing_descriptions,
         "missing_priority": missing_priority,
+        "missing_expiry": missing_expiry,
         "wiki_drift": wiki_drift,
         "relative_dates": relative_dates,
         "source_anchor_issues": source_anchor_issues,
         "claim_anchor_issues": claim_anchor_issues,
         "stale_open_questions": stale_open_questions,
         "open_contradictions": open_contradictions,
+        "stale_backing": stale_backing,
+        "oversized_core": oversized_core,
         # Refs that look like aliases of one another. Detection only — the
         # report is a question for a human, never an instruction to merge.
         "entity_aliases": check_entity_aliases(entity_references),

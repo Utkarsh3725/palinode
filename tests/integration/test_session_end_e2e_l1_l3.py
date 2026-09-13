@@ -141,7 +141,25 @@ def cli_with_api_redirect(api_client):
     default client is constructed via ``PalinodeAPI()`` rather than snapshotting and
     restoring the old one. """
     from palinode.cli._api import PalinodeAPI, api_client as cli_api_client
+    import importlib
+
+    # ``palinode.cli.session_end`` the attribute is the click Command (the
+    # package re-exports it); the module is only reachable by name.
+    session_end_cmd = importlib.import_module("palinode.cli.session_end")
     from palinode.core.defaults import SAVE_SOURCE_HEADER
+
+    # The swap below only reaches the CLI if the command module and this
+    # fixture hold the *same* singleton. An earlier test that evicted
+    # ``palinode.cli._api`` from ``sys.modules`` and re-imported it splits
+    # that identity, and the symptom downstream is a bare ECONNREFUSED that
+    # took a bisection to explain (the session-end test-isolation fix). Name it
+    # here instead.
+    assert session_end_cmd.api_client is cli_api_client, (
+        "palinode.cli.session_end.api_client is not palinode.cli._api.api_client: "
+        "a test earlier in this session re-imported palinode.cli._api and split "
+        "the singleton. Import-time checks belong in a subprocess (see "
+        "tests/test_session_end_timeout.py and tests/test_module_identity_guard.py)."
+    )
 
     def _handler(request: httpx.Request) -> httpx.Response:
         # Delegate to the in-process TestClient so the FastAPI app handles

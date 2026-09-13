@@ -22,7 +22,10 @@ from typing import Any, Collection, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from palinode.core.config import config
 from palinode.core import aliases
+from palinode.core import expiry as _expiry
 from palinode.core import parser as _parser
+from palinode.core.lifecycle import contains_retired_fact_text, eligibility
+from palinode.core.quote_verify import QuoteStatus, verify_source_anchors
 # The hybrid-search scoring pipeline + its pure decay/predicate helpers live in
 # ranker.py. Re-exported here so `store.effective_importance`,
 # `store._is_daily_file`, etc. keep resolving for internal callers and tests.
@@ -377,6 +380,18 @@ def init_db() -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # The derived-text domain (palinode.core.projection): ``content`` is the
+    # projected current-state text, ``projected_hash`` hashes it, and
+    # ``projection_version`` says which rules produced it. ``content_hash``
+    # stays a hash of the raw section — the source domain check_freshness
+    # and anchor verification compare against. NULL on pre-upgrade rows,
+    # which reconcile.plan treats as "not yet projected" and re-derives.
+    for _col in ("projected_hash TEXT", "projection_version INTEGER"):
+        try:
+            db.execute(f"ALTER TABLE chunks ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     try:
         db.execute("ALTER TABLE chunks ADD COLUMN importance FLOAT DEFAULT 0.5")
         db.execute("ALTER TABLE chunks ADD COLUMN last_recalled TEXT")
@@ -410,9 +425,19 @@ def init_db() -> None:
             last_fired TEXT,
             fire_count INT DEFAULT 0,
             created_at TEXT,
-            enabled INT DEFAULT 1
+            enabled INT DEFAULT 1,
+            expires_at TEXT,
+            authority TEXT
         )
     """)
+    # Acting-state expiry + authority (see palinode.core.expiry). NULL on
+    # pre-upgrade rows: a trigger without expires_at never expires, exactly
+    # as before; authority is display-only.
+    for _col in ("expires_at TEXT", "authority TEXT"):
+        try:
+            db.execute(f"ALTER TABLE triggers ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     db.execute(f"""
         CREATE VIRTUAL TABLE IF NOT EXISTS triggers_vec USING vec0(
             id TEXT PRIMARY KEY,
@@ -511,6 +536,25 @@ def fts5_delete_chunk(cursor: sqlite3.Cursor, chunk_id: str) -> None:
     )
 
 
+def _fts_holds_chunk(cur: sqlite3.Cursor, chunk_id: str) -> bool:
+    """Does the FTS5 index hold a document for this chunk's rowid?
+
+    ``chunks_fts_docsize`` has one row per indexed document (the same shadow
+    table the doctor's sync check counts), keyed by the source rowid. A
+    missing ``chunks`` row, a missing shadow table, or any error reads as
+    "not held" so the caller skips the delete rather than risking one.
+    """
+    try:
+        row = cur.execute(
+            "SELECT 1 FROM chunks_fts_docsize WHERE id = "
+            "(SELECT rowid FROM chunks WHERE id = ?)",
+            (chunk_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
 def write_chunk_row(
     cur: sqlite3.Cursor,
     *,
@@ -525,6 +569,8 @@ def write_chunk_row(
     created_at: str | None,
     last_updated: str | None,
     embedding: list[float],
+    projected_hash: str | None = None,
+    projection_version: int | None = None,
 ) -> tuple[bool, bool]:
     """Write one chunk's ``chunks`` + ``chunks_vec`` + ``chunks_fts`` rows.
 
@@ -532,9 +578,33 @@ def write_chunk_row(
     whole file's chunks under one ``transaction()``). Returns ``(vec_ok,
     fts_ok)`` for per-index health. An empty ``embedding`` is the deliberate
     FTS-only path (deferred/keyword-only) and does not clear ``vec_ok``.
+
+    ``content`` is the *derived* text (the current-text projection the
+    embedder and FTS see); ``content_hash`` is over the *raw* section it was
+    derived from, and ``projected_hash`` / ``projection_version`` describe
+    the derived text. Leaving the last two ``None`` writes a row the reconcile
+    planner will re-derive on its next pass, exactly like a pre-upgrade row.
     """
     vec_ok = True
     fts_ok = True
+
+    # An existing row is about to have its ``content`` overwritten. The FTS5
+    # tokens for that row can only be removed with the ``'delete'`` command
+    # fed the values *as indexed* — i.e. the old content — so this must run
+    # before the UPDATE below, while the chunks row still holds them. Without
+    # it the old tokens stayed in the inverted index next to the new ones and
+    # a term that no longer appears in the chunk kept matching it. Only done
+    # when the FTS shadow table actually holds the rowid: a 'delete' for a
+    # document FTS never indexed is undefined behaviour.
+    if _fts_holds_chunk(cur, chunk_id):
+        try:
+            fts5_delete_chunk(cur, chunk_id)
+        except Exception as _pre_exc:
+            _store_logger.warning(
+                "palinode.store: FTS5 pre-update delete failed for %r (file=%r) — "
+                "stale tokens may linger until rebuild: %s",
+                chunk_id, file_path, _pre_exc,
+            )
 
     # H2: INSERT OR REPLACE would revert the recall columns (importance,
     # recall_count, last_recalled) — not in this column list — to defaults on
@@ -544,8 +614,9 @@ def write_chunk_row(
         """
         INSERT INTO chunks
         (id, file_path, section_id, category, content, metadata,
-         created_at, last_updated, content_hash, meta_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         created_at, last_updated, content_hash, meta_hash,
+         projected_hash, projection_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             file_path = excluded.file_path,
             section_id = excluded.section_id,
@@ -555,11 +626,14 @@ def write_chunk_row(
             created_at = excluded.created_at,
             last_updated = excluded.last_updated,
             content_hash = excluded.content_hash,
-            meta_hash = excluded.meta_hash
+            meta_hash = excluded.meta_hash,
+            projected_hash = excluded.projected_hash,
+            projection_version = excluded.projection_version
         """,
         (
             chunk_id, file_path, section_id, category, content, metadata_json,
             created_at, last_updated, content_hash, meta_hash,
+            projected_hash, projection_version,
         ),
     )
 
@@ -568,11 +642,20 @@ def write_chunk_row(
         # Deferred/keyword-only row: no vector yet. The absent chunks_vec row
         # is the exact signal reconcile.plan re-indexes on, so the row
         # converges once the embedder is reachable. Deliberate skip, not a
-        # failure: vec_ok untouched.
+        # failure: vec_ok untouched. Any vector already stored for this id
+        # described the *previous* text and must go with it — left in place
+        # it would read as "embedded" and the re-embed would never come.
         _store_logger.debug(
             "palinode.store: empty embedding for %r — chunks+FTS only, "
             "vec write deferred", chunk_id,
         )
+        try:
+            cur.execute("DELETE FROM chunks_vec WHERE id = ?", (chunk_id,))
+        except Exception as _stale_exc:
+            _store_logger.debug(
+                "palinode.store: stale chunks_vec drop skipped for %r: %s",
+                chunk_id, _stale_exc,
+            )
     else:
         emb_json = json.dumps(embedding)
         try:
@@ -654,6 +737,23 @@ def write_chunk_meta(
     cur.execute(
         "UPDATE chunks SET metadata = ?, meta_hash = ? WHERE id = ?",
         (metadata_json, meta_hash, chunk_id),
+    )
+
+
+def write_chunk_projection(
+    cur: sqlite3.Cursor, chunk_id: str, projected_hash: str, projection_version: int,
+) -> None:
+    """Stamp a chunk's projection hash and version without rewriting its text.
+
+    For a row whose stored ``content`` already equals the current projection
+    (a pre-upgrade row of a section with nothing to project out): the derived
+    text, its vector and its FTS tokens are all correct, only the stamp is
+    missing. Writing the stamp alone is what keeps the migration from
+    re-embedding a whole store.
+    """
+    cur.execute(
+        "UPDATE chunks SET projected_hash = ?, projection_version = ? WHERE id = ?",
+        (projected_hash, projection_version, chunk_id),
     )
 
 
@@ -979,16 +1079,72 @@ def sanitize_fts_query(query: str) -> str:
     Returns:
         A sanitized query string safe for FTS5 MATCH expressions.
     """
-    # Remove quotes (FTS5 phrase search with unmatched quotes causes errors)
-    query = re.sub(r'["\']', ' ', query)
     # Remove boolean operators that FTS5 would misinterpret
     query = re.sub(r'\b(AND|OR|NOT)\b', ' ', query, flags=re.IGNORECASE)
-    # Convert hyphens to spaces (FTS5 treats hyphen as NOT operator)
-    query = re.sub(r'-(?=\w)', ' ', query)
+    # Replace every remaining non-word, non-whitespace character with a space.
+    # FTS5 barewords admit only [A-Za-z0-9_] and non-ASCII, so anything else —
+    # quotes, hyphens, and syntax/operator characters like ? : ( ) * ^ { } . —
+    # is an operator or a MATCH syntax error when it reaches the parser. A
+    # trailing '?' alone raised "fts5: syntax error", which cost hybrid search
+    # its BM25 arm on every question-shaped query. Subsumes the former
+    # quote-stripping and hyphen-to-space rules.
+    query = re.sub(r'[^\w\s]', ' ', query)
     # Normalize whitespace
     query = ' '.join(query.split())
-    # Ensure non-empty
-    return query if query.strip() else '*'
+    # Ensure non-empty. '""' is the empty phrase: valid FTS5 that matches
+    # nothing. (The old fallback '*' was itself a MATCH syntax error.)
+    return query if query else '""'
+
+
+#: Words that carry no keyword signal: articles, prepositions, pronouns,
+#: auxiliaries, interrogatives. Question-shaped queries are mostly these, and
+#: under FTS5's implicit AND every one of them had to co-occur in the chunk.
+FTS_STOPWORDS = frozenset("""
+a an the and or but if then of in on at to for from by with about as into like through after over
+between out against during without before under around among is are was were be been being am do
+does did doing have has had having i me my mine we our ours you your yours he him his she her hers it
+its they them their theirs this that these those what which who whom whose how much many when where
+why will would shall should can could may might must not no nor so than too very just also there here
+s t d ll m re ve
+""".split())
+
+
+def fts_match_expression(query: str) -> str:
+    """Turn a natural-language query into an FTS5 MATCH expression that a
+    question can actually satisfy.
+
+    FTS5 joins bare terms with implicit AND, so ``"why does consolidation skip
+    groups"`` required all five words in one chunk and matched nothing — for
+    the dominant caller shape (an agent asking a question) hybrid search was
+    vector-only. Measured on LongMemEval-V2 web, the empty arm cost 5.8 points
+    on exact-label questions against an OR-joined arm (the implicit-AND finding).
+
+    Rules, in order:
+
+    * Each whitespace-delimited raw token is sanitized on its own. A token that
+      sanitizes to several words — ``CVE-2026-31889``, ``v0.16.0``,
+      ``palinode/core`` — becomes a *phrase* (``"cve 2026 31889"``) so an
+      identifier still has to match exactly and in order. A single word is
+      quoted as a one-word phrase (quoting sidesteps every bareword rule).
+    * Stopword units are dropped. If nothing survives, every unit is kept:
+      ``"what is it"`` should still match something rather than nothing.
+    * Units are joined with ``OR``. BM25 already scores a chunk higher for each
+      additional matched term, so a short query ranks as it did under AND and a
+      question finally reaches the arm at all.
+
+    Returns ``'""'`` (the empty phrase, valid and matching nothing) for a
+    query with no word characters.
+    """
+    units: list[str] = []
+    for raw in query.split():
+        words = sanitize_fts_query(raw)
+        if words == '""':
+            continue
+        units.append('"' + words + '"')
+    if not units:
+        return '""'
+    content = [u for u in units if u.strip('"').lower() not in FTS_STOPWORDS]
+    return " OR ".join(content or units)
 
 
 def search_fts(query: str, category: str | None = None, top_k: int = 10,
@@ -1014,9 +1170,9 @@ def search_fts(query: str, category: str | None = None, top_k: int = 10,
     try:
         cursor = db.cursor()
 
-        # FTS5 match query — sanitize before passing to MATCH
-        # sanitize_fts_query handles quotes, hyphens, and boolean operators
-        safe_query = sanitize_fts_query(query)
+        # FTS5 match query — OR-joined content words / identifier phrases (the implicit-AND finding);
+        # sanitize_fts_query handles quotes, hyphens, and boolean operators per token.
+        safe_query = fts_match_expression(query)
 
         sql = """
             SELECT c.id, c.file_path, c.section_id, c.content, c.category, c.metadata,
@@ -1091,51 +1247,141 @@ def check_freshness(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     chasing a staleness that isn't there. (The frontmatter field stays on
     disk as provenance; this was its only reader.)
 
-    Returns results with added 'freshness' key: 'valid' | 'stale' | 'unknown'
+    ``freshness`` answers exactly one question — does the index agree with the
+    source file? — and it is the only question a hash can answer. A chunk whose
+    section still contains a superseded fact's tombstone is ``valid``: the index
+    faithfully reflects the file. The comparand is the **raw** section: the
+    indexer stores the current-text projection as ``chunks.content`` (see
+    :mod:`palinode.core.projection`) but keeps ``content_hash`` over the raw
+    bytes, in a separate column from ``projected_hash``, so this check never
+    compares a projected text against a source. Two further, independent questions are
+    answered alongside it, each in its own additive key, so that a matching hash
+    can never be read as the assertion being current:
+
+    ``span_integrity``
+        Whether the spans the record cites (``sources:`` quote anchors) are
+        still present verbatim in the files they cite, via the same verifier
+        ``palinode_blame`` uses. ``unanchored`` when the record cites nothing;
+        otherwise ``ok`` or the worst :class:`QuoteStatus` among its anchors
+        (``anchor_tampered`` / ``source_drifted`` / ``source_missing``).
+    ``currency``
+        Whether the assertion is still in force, from the lifecycle classifier
+        on the file's **live** frontmatter (``chunks.metadata`` can lag a
+        frontmatter-only edit) plus the chunk text: ``retired`` when the record
+        is retired or the chunk carries a retired fact tombstone, ``contested``
+        when it is in an open ``contradicts`` conflict, else the declared state,
+        ``current`` or ``unmarked``. ``currency_reason`` says which signal
+        decided (``status:archived``, ``superseded_by: …``, ``retired fact
+        text``, ``contradicts: …``, ``unmarked``, …).
+
+    Returns results with added keys:
+    ``freshness``: ``valid`` | ``stale`` | ``unknown`` (unchanged contract);
+    ``span_integrity``; ``currency``: ``current`` | ``retired`` | ``contested``
+    | ``unmarked``; ``currency_reason``.
     """
-    # Cache parsed sections per file path to avoid re-reading the same file
-    # once per result when multiple chunks come from the same file.
-    _sections_cache: dict[str, list[dict[str, str]]] = {}
+    # Cache the parsed file per path to avoid re-reading the same file once
+    # per result when multiple chunks come from the same file. ``None`` marks
+    # a file that could not be read or parsed.
+    _parsed_cache: dict[str, tuple[dict[str, Any], list[dict[str, str]]] | None] = {}
+
+    def _parsed(full_path: str) -> tuple[dict[str, Any], list[dict[str, str]]] | None:
+        if full_path not in _parsed_cache:
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                meta, sections = _parser.parse_markdown(raw)
+                _parsed_cache[full_path] = (meta if isinstance(meta, dict) else {}, sections)
+            except Exception:
+                _parsed_cache[full_path] = None
+        return _parsed_cache[full_path]
 
     for result in results:
         file_path = result.get("file_path", "")
         stored_hash = result.get("content_hash")
+        full_path = os.path.join(config.palinode_dir, file_path) if not os.path.isabs(file_path) else file_path
+        exists = os.path.exists(full_path)
+        parsed = _parsed(full_path) if exists else None
 
+        # (a) index/source agreement — the hash comparison, unchanged.
         if not stored_hash:
             result["freshness"] = "unknown"
-            continue
-
-        full_path = os.path.join(config.palinode_dir, file_path) if not os.path.isabs(file_path) else file_path
-        if not os.path.exists(full_path):
+        elif not exists:
             result["freshness"] = "stale"
-            continue
-
-        try:
-            if full_path not in _sections_cache:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                _, sections = _parser.parse_markdown(raw)
-                _sections_cache[full_path] = sections
-
-            sections = _sections_cache[full_path]
+        elif parsed is None:
+            result["freshness"] = "unknown"
+        else:
             section_id = result.get("section_id", "root")
-
             # Find the section whose section_id matches this chunk.
-            matching = next((s for s in sections if s["section_id"] == section_id), None)
+            matching = next((s for s in parsed[1] if s["section_id"] == section_id), None)
             if matching is None:
                 # Section no longer exists in the file — content was removed.
                 result["freshness"] = "stale"
-                continue
+            else:
+                # Hash the section content exactly as the indexer does (fix).
+                full_hash = hashlib.sha256(matching["content"].encode()).hexdigest()
+                # Support both full (64-char) and legacy truncated (16-char) hashes.
+                current_hash = full_hash if len(stored_hash) > 16 else full_hash[:16]
+                result["freshness"] = "valid" if current_hash == stored_hash else "stale"
 
-            # Hash the section content exactly as the indexer does (fix).
-            full_hash = hashlib.sha256(matching["content"].encode()).hexdigest()
-            # Support both full (64-char) and legacy truncated (16-char) hashes.
-            current_hash = full_hash if len(stored_hash) > 16 else full_hash[:16]
-            result["freshness"] = "valid" if current_hash == stored_hash else "stale"
-        except Exception:
-            result["freshness"] = "unknown"
+        # (b) source-span integrity and (c) assertion currency, from the live
+        # file. Without one there is nothing to classify: the least-claiming
+        # value, with the reason, rather than a guess from indexed metadata.
+        if parsed is None:
+            result["span_integrity"] = "unanchored"
+            result["currency"] = "unmarked"
+            result["currency_reason"] = "source missing" if not exists else "source unreadable"
+            continue
+        meta = parsed[0]
+        result["span_integrity"] = _span_integrity(meta)
+        result["currency"], result["currency_reason"] = currency_of(
+            meta, file_path, result.get("content") or ""
+        )
 
     return results
+
+
+# Worst-first: a non-``ok`` anchor always wins, and among failures the one
+# that says the anchor itself is unusable outranks the ones about its source.
+_SPAN_STATUS_ORDER: tuple[QuoteStatus, ...] = (
+    QuoteStatus.ANCHOR_TAMPERED,
+    QuoteStatus.SOURCE_DRIFTED,
+    QuoteStatus.SOURCE_MISSING,
+    QuoteStatus.OK,
+)
+
+
+def _span_integrity(meta: dict[str, Any]) -> str:
+    """Summarise a record's ``sources:`` anchors into one ``span_integrity`` value."""
+    if not isinstance(meta.get("sources"), list):
+        return "unanchored"
+    try:
+        checks = verify_source_anchors(meta.get("sources"), config.memory_dir)
+    except Exception:
+        return "unanchored"
+    if not checks:
+        return "unanchored"
+    statuses = {c.status for c in checks}
+    return next(s.value for s in _SPAN_STATUS_ORDER if s in statuses)
+
+
+def currency_of(
+    meta: dict[str, Any], file_path: str, content: str, *, now: datetime | None = None
+) -> tuple[str, str]:
+    """``(currency, reason)`` for one chunk from its file's live frontmatter and its text.
+
+    ``now`` is the clock for ``expires_at``; ``None`` reads the wall clock.
+    """
+    elig = eligibility(meta, path=file_path, now=now)
+    if elig.retired:
+        reason = elig.reason
+        if elig.superseded_by:
+            reason = f"superseded_by: {elig.superseded_by}"
+        return "retired", reason
+    if contains_retired_fact_text(content):
+        return "retired", "retired fact text"
+    if elig.contradicts:
+        return "contested", "contradicts: " + ", ".join(elig.contradicts)
+    return elig.state, elig.reason
 
 
 def list_recent(
@@ -1595,6 +1841,44 @@ repair path).
         db.close()
 
 
+def _mark_vectorless(fts_results: list[dict[str, Any]]) -> None:
+    """Annotate BM25 candidates in place with ``has_vector``.
+
+    A chunk written FTS-only — the per-input embed-rejection path, or a deferred
+    embed — has no ``chunks_vec`` row, so the vector arm can never carry it
+    and normalized BM25 (``raw / 25.0``, rarely above 0.35 even for an exact
+    identifier hit) is the only score it will ever have. Under the shared
+    per-arm floor that made it unreachable at the default threshold while
+    the recovery text promised it "stays keyword-searchable".
+    :func:`palinode.core.ranker.rank_hybrid` exempts ``has_vector is False``
+    candidates from the floor; everything with a vector keeps today's floor
+    (the BM25-arm measurement that deferred renormalising it holds for
+    those). Point lookups against vec0 — the same presence check
+    ``reconcile._vec_present`` uses to plan REEMBED, so the exemption retires
+    on its own once the vector is backfilled.
+
+    On a lookup failure the candidate is left as ``has_vector=True``, i.e.
+    thresholded exactly as before this fix, and the failure is logged.
+    """
+    db = get_db()
+    try:
+        for r in fts_results:
+            try:
+                row = db.execute(
+                    "SELECT 1 FROM chunks_vec WHERE id = ?", (r.get("id"),)
+                ).fetchone()
+            except Exception as exc:
+                _store_logger.warning(
+                    "vector presence check failed; thresholding as vectored "
+                    "op=search chunk_id=%s error=%r", r.get("id"), str(exc),
+                )
+                r["has_vector"] = True
+                continue
+            r["has_vector"] = row is not None
+    finally:
+        db.close()
+
+
 def search_hybrid(
     query_text: str,
     query_embedding: list[float],
@@ -1611,6 +1895,7 @@ def search_hybrid(
     session_id: str | None = None,
     record_access: bool = True,
     use_fts: bool = True,
+    fts_threshold: float | None = None,
 ) -> list[dict[str, Any]]:
     """Hybrid search combining semantic vectors and BM25 keyword matching.
 
@@ -1622,9 +1907,16 @@ def search_hybrid(
         query_embedding: The embedded query vector (for cosine similarity).
         category: Optional category filter applied to both searches.
         top_k: Maximum results to return.
-        threshold: Minimum PER-ARM relevance floor — real cosine similarity for
-            vector candidates, normalized BM25 for FTS candidates — applied
-            BEFORE RRF fusion (see :func:`palinode.core.ranker.rank_hybrid`).
+        threshold: The VECTOR arm's relevance floor — real cosine similarity —
+            applied BEFORE RRF fusion (see :func:`palinode.core.ranker.rank_hybrid`).
+        fts_threshold: The FTS arm's own floor, as a fraction of the best
+            keyword match in this result set (``config.search.fts_threshold``
+            when ``None``; measured default 0.4; ``0.0`` = no FTS floor). Until
+            this existed the cosine floor was applied to normalized BM25 too,
+            and at 0.4/0.5 it discarded most correct keyword hits — every
+            single-identifier hit among them — before fusion.
+            FTS candidates with no ``chunks_vec`` row (written FTS-only) are
+            exempt: the keyword arm is the only arm they have.
             NOT a cutoff on the fused score: a production measurement found
             the post-RRF score to be a function of rank, not relevance, so
             thresholding it there selects a near-invariant rank cutoff
@@ -1655,7 +1947,7 @@ def search_hybrid(
     # Get vector candidates. record_access=False: search_hybrid records recall
     # on its final merged hit set, not on these candidates. threshold=0.0 here
     # is deliberate: this is a wide-net candidate fetch — rank_hybrid applies
-    # the caller's real `threshold` itself, per-arm, before fusion (see its
+    # the caller's real vector `threshold` itself before fusion (see its
     # docstring).
     vec_results = search(query_embedding, category=category, top_k=top_k * 2, threshold=0.0,
                          record_access=False, kind_exclude_list=kind_exclude_list)
@@ -1666,16 +1958,24 @@ def search_hybrid(
         try:
             fts_results = search_fts(query_text, category=category, top_k=top_k * 2,
                                      kind_exclude_list=kind_exclude_list)
-        except Exception:
+        except Exception as first_exc:
             # FTS5 corrupted — rebuild and retry once
             import logging
-            logging.getLogger("palinode.store").warning("FTS5 corrupted, rebuilding...")
+            logging.getLogger("palinode.store").warning(
+                "FTS5 query failed (%s), rebuilding index and retrying...", first_exc)
             rebuild_fts()
             try:
                 fts_results = search_fts(query_text, category=category, top_k=top_k * 2,
                                          kind_exclude_list=kind_exclude_list)
-            except Exception:
-                fts_results = []  # Give up on BM25, return vector-only
+            except Exception as exc:
+                # Give up on BM25 — but never silently: an invisible
+                # degradation to vector-only is how a sanitizer gap went
+                # unnoticed while every question-shaped query lost this arm.
+                logging.getLogger("palinode.store").warning(
+                    "BM25 arm dropped, returning vector-only results: %s", exc)
+                fts_results = []
+        if fts_results:
+            _mark_vectorless(fts_results)
     else:
         # No BM25 arm at all — force vec_weight = 1.0 (see docstring).
         effective_hybrid_weight = 0.0
@@ -1690,7 +1990,7 @@ def search_hybrid(
             for row in get_entity_files(entity):
                 context_files.add(row["file_path"])
 
-    # Fuse + re-rank (threshold → RRF → decay → priority → context → daily →
+    # Fuse + re-rank (arm floors → RRF → decay → priority → context → daily →
     # dedup → top_k → date) in the pure ranker. priority_weight is read from
     # this module so patch.object(store, "_PRIORITY_RANK_WEIGHT", ...) still
     # tunes ordering.
@@ -1699,6 +1999,7 @@ def search_hybrid(
         fts_results,
         top_k=top_k,
         threshold=threshold,
+        fts_threshold=fts_threshold,
         hybrid_weight=effective_hybrid_weight,
         priority_weight=_PRIORITY_RANK_WEIGHT,
         context_files=context_files,
@@ -1927,9 +2228,11 @@ def add_trigger(
     embedding: list[float],
     threshold: float = 0.75,
     cooldown_hours: int = 24,
+    expires_at: str | None = None,
+    authority: str | None = None,
 ) -> None:
     """Register a prospective trigger.
-    
+
     Args:
         trigger_id: Unique ID for this trigger.
         description: What context should fire this (e.g., "LoRA training").
@@ -1937,13 +2240,16 @@ def add_trigger(
         embedding: Pre-computed embedding of the description.
         threshold: Cosine similarity threshold to fire (0.0-1.0).
         cooldown_hours: Hours between refires.
+        expires_at: ISO-8601 timestamp after which the trigger no longer
+            fires (``None`` = never expires). See ``palinode.core.expiry``.
+        authority: Free text naming who/what licensed this trigger to act.
     """
     db = get_db()
     now = _utc_now().isoformat().replace("+00:00", "Z")
     db.execute("""
-        INSERT OR REPLACE INTO triggers (id, description, memory_file, threshold, cooldown_hours, created_at, enabled, fire_count)
-        VALUES (?, ?, ?, ?, ?, ?, 1, 0)
-    """, (trigger_id, description, memory_file, threshold, cooldown_hours, now))
+        INSERT OR REPLACE INTO triggers (id, description, memory_file, threshold, cooldown_hours, created_at, enabled, fire_count, expires_at, authority)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+    """, (trigger_id, description, memory_file, threshold, cooldown_hours, now, expires_at, authority))
     
     # ADR-002: vec0 does not reliably honor `INSERT OR REPLACE` (can raise a
     # UNIQUE constraint error on an existing primary key instead of replacing
@@ -1990,16 +2296,28 @@ def check_triggers(
     for row in rows:
         if not row["enabled"]:
             continue
-            
+        # Authority monotonicity: an expired trigger no longer acts, even if
+        # the TTL sweep has not yet disabled it. Reported once per process,
+        # not once per prompt (see palinode.core.expiry).
+        if _expiry.is_past(row["expires_at"], now):
+            _expiry.report_expired_once("trigger", row["id"], row["expires_at"])
+            continue
+
         dist = row["distance"] or 0
         score = 1.0 - ((dist ** 2) / 2.0)
         
         if score >= row["threshold"]:
             if not cooldown_bypass and row["last_fired"]:
-                last_fired_date = datetime.fromisoformat(row["last_fired"][:19])
-                hours_since = (now - last_fired_date).total_seconds() / 3600
-                if hours_since < row["cooldown_hours"]:
-                    continue  # In cooldown
+                # ``now`` is aware, so ``last_fired`` must be too — the same
+                # parse as ``expires_at``: ``Z`` or offset as written by
+                # ``update_trigger_fired``, a legacy naive string as UTC.
+                # An unparseable value cannot gate; the trigger fires and
+                # the firing rewrites the column in the current format.
+                last_fired_date = _expiry.parse_expires_at(row["last_fired"])
+                if last_fired_date is not None:
+                    hours_since = (now - last_fired_date).total_seconds() / 3600
+                    if hours_since < row["cooldown_hours"]:
+                        continue  # In cooldown
             
             results.append({
                 "id": row["id"],
@@ -2017,9 +2335,30 @@ def check_triggers(
 def list_triggers() -> list[dict]:
     """Return all registered triggers with their stats."""
     db = get_db()
-    rows = db.execute("SELECT id, description, memory_file, threshold, cooldown_hours, last_fired, fire_count, created_at, enabled FROM triggers ORDER BY created_at DESC").fetchall()
+    rows = db.execute("SELECT id, description, memory_file, threshold, cooldown_hours, last_fired, fire_count, created_at, enabled, expires_at, authority FROM triggers ORDER BY created_at DESC").fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+def expire_triggers(now: datetime | None = None, dry_run: bool = False) -> list[str]:
+    """Disable every enabled trigger whose ``expires_at`` has passed.
+
+    The trigger half of the ADR-015 §2.3 TTL sweep (``archive_expired``): one
+    clock for both acting state types. ``check_triggers`` refuses an expired
+    trigger on its own, so this is bookkeeping — it makes the lapse visible
+    in ``palinode trigger list`` (``enabled: 0``) rather than only in the
+    log. Returns the ids affected; ``dry_run`` reports without writing.
+    """
+    now = now or _utc_now()
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, expires_at FROM triggers WHERE enabled = 1 AND expires_at IS NOT NULL"
+    ).fetchall()
+    expired = [r["id"] for r in rows if _expiry.is_past(r["expires_at"], now)]
+    if expired and not dry_run:
+        db.executemany("UPDATE triggers SET enabled = 0 WHERE id = ?", [(i,) for i in expired])
+        db.commit()
+    db.close()
+    return expired
 
 def delete_trigger(trigger_id: str) -> None:
     """Remove a trigger."""

@@ -38,6 +38,10 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
             * ``chunks_unchanged`` (int): sections already fully indexed.
             * ``chunks_reembedded`` (int): FTS-only rows re-indexed once a vector
               became available.
+            * ``chunks_reprojected`` (int): rows whose derived text was
+              re-derived under the current projection version.
+            * ``chunks_stamped`` (int): rows that only received the projection
+              stamp (derived text and vector already correct).
             * ``chunks_deleted`` (int): obsolete rows pruned for this file.
             * ``indexed_vec`` / ``indexed_fts`` (bool): per-index health.
             * ``error`` (str | None): one-line failure/deferral reason, if any.
@@ -49,6 +53,8 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
         "chunks_written": 0,
         "chunks_unchanged": 0,
         "chunks_reembedded": 0,
+        "chunks_reprojected": 0,
+        "chunks_stamped": 0,
         "chunks_deleted": 0,
         "error": None,
     }
@@ -77,6 +83,8 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
         chunks_written=diff.written,
         chunks_unchanged=diff.unchanged,
         chunks_reembedded=diff.reembedded,
+        chunks_reprojected=diff.reprojected,
+        chunks_stamped=diff.stamped,
         chunks_deleted=diff.deleted,
         error=diff.error,
     )

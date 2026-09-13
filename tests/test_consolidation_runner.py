@@ -13,7 +13,8 @@ seam (``llm_fn``), on a real ``tmp_path`` store, and assert on what is left in
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -224,7 +225,180 @@ def test_partition_leaves_a_note_if_any_of_its_groups_is_unresolved():
         {"filepath": "none", "mentions": ["person/pat"]},
     ]
 
-    retire, left = runner._partition_notes_for_archive(notes, unresolved={"beta"})
+    partition = runner._partition_notes_for_archive(
+        notes, unresolved={"beta"}, today="2026-01-01"
+    )
 
-    assert [n["filepath"] for n in retire] == ["a", "none"]
-    assert [n["filepath"] for n in left] == ["ab", "b"]
+    assert [n["filepath"] for n in partition.retire] == ["a"]
+    assert [n["filepath"] for n in partition.unresolved] == ["ab", "b"]
+    # A person-only note formed no group, so no pass ever saw it: it stays.
+    assert [n["filepath"] for n in partition.no_project] == ["none"]
+    assert [n["filepath"] for n in partition.left] == ["ab", "b", "none"]
+
+
+def test_partition_keeps_todays_daily_note_whatever_its_groups():
+    """Only ``daily/<today>.md`` is the live file — a same-day note elsewhere,
+    or a daily note for another day, follows the ordinary rule."""
+    notes = [
+        {"filepath": "/m/daily/2026-09-12.md", "mentions": ["project/alpha"]},
+        {"filepath": "/m/daily/2026-09-11.md", "mentions": ["project/alpha"]},
+        {"filepath": "/m/insights/2026-09-12.md", "mentions": ["project/alpha"]},
+    ]
+
+    partition = runner._partition_notes_for_archive(notes, unresolved=set(), today="2026-09-12")
+
+    assert [n["filepath"] for n in partition.today] == ["/m/daily/2026-09-12.md"]
+    assert [n["filepath"] for n in partition.retire] == [
+        "/m/daily/2026-09-11.md", "/m/insights/2026-09-12.md",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Notes the pass never saw, groups that decided nothing, and the live daily note
+# ---------------------------------------------------------------------------
+
+def test_note_with_no_project_ref_stays_in_place_and_is_counted(store, caplog):
+    memory_dir, notes = store
+    # Nothing here trips the keyword fallback either, so it truly forms no group.
+    loose = _note(memory_dir, "loose", "A reflection that names nobody and nothing.")
+    llm = _llm_by_project(alpha=_update_op("a1"), beta=_update_op("b1"))
+
+    with caplog.at_level(logging.INFO, logger="palinode.consolidation"):
+        result = runner.run_consolidation(llm_fn=llm)
+
+    assert loose.name in _in_daily(memory_dir)
+    assert loose.name not in _archived(memory_dir)
+    assert result["notes_no_project"] == 1
+    assert result["notes_left_in_place"] == 2  # loose + ghost
+    warning = next(
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "left in place" in r.getMessage()
+    )
+    assert f"no project/ reference, so no group ever saw them: {loose.name}" in warning
+    assert notes["ghost"].name in warning
+
+
+def test_zero_op_group_retires_its_notes_and_is_named(store, caplog):
+    """The model saw alpha's notes and chose to change nothing: that is a
+    decision, so the notes retire — but the group must be visible."""
+    memory_dir, notes = store
+    llm = _llm_by_project(alpha="[]", beta=_update_op("b1"))
+
+    with caplog.at_level(logging.INFO, logger="palinode.consolidation"):
+        result = runner.run_consolidation(llm_fn=llm)
+
+    assert result["status"] == "success"
+    assert result["projects_compacted"] == 1
+    assert result["projects_no_ops"] == ["alpha"]
+    assert result["groups_no_ops"] == 1
+    assert result["projects_all_ops_filtered"] == []
+    assert _archived(memory_dir) == {notes["alpha"].name, notes["beta"].name, notes["both"].name}
+    assert "Old alpha fact." in (memory_dir / "projects" / "alpha.md").read_text()
+    info = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.INFO and "proposed no operations" in r.getMessage()
+    ]
+    assert info == ["palinode.consolidation: 1 project group(s) proposed no operations: alpha"]
+
+
+def test_all_zero_op_groups_still_drain_daily(store):
+    """A quiet week is the common case; it must not leave daily/ growing forever."""
+    memory_dir, notes = store
+    llm = _llm_by_project(alpha="[]", beta="[]")
+
+    result = runner.run_consolidation(llm_fn=llm)
+
+    assert result["projects_compacted"] == 0
+    assert result["projects_no_ops"] == ["alpha", "beta"]
+    assert result["notes_archived"] == 3
+    assert _in_daily(memory_dir) == {notes["ghost"].name}
+
+
+def test_group_whose_ops_were_all_filtered_is_named(store, caplog, monkeypatch):
+    memory_dir, notes = store
+    monkeypatch.setattr(config.consolidation, "allowed_ops", ["KEEP"])
+    llm = _llm_by_project(
+        alpha=_update_op("a1"),
+        beta=json.dumps([{"op": "KEEP", "id": "b1"}]),
+    )
+
+    with caplog.at_level(logging.INFO, logger="palinode.consolidation"):
+        result = runner.run_consolidation(llm_fn=llm)
+
+    assert result["projects_compacted"] == 1
+    assert result["projects_all_ops_filtered"] == ["alpha"]
+    assert result["groups_all_ops_filtered"] == 1
+    assert result["projects_no_ops"] == []
+    assert "Old alpha fact." in (memory_dir / "projects" / "alpha.md").read_text()
+    assert notes["alpha"].name in _archived(memory_dir)
+    info = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.INFO and "allowed_ops" in r.getMessage()
+    ]
+    assert info == [
+        "palinode.consolidation: 1 project group(s) had every proposed operation "
+        "removed by allowed_ops: alpha"
+    ]
+
+
+def test_todays_daily_note_is_never_moved_but_yesterdays_is(store, caplog):
+    """Keeping today's note is the expected outcome of every mid-day run: it
+    gets its own INFO line, never the left-in-place WARNING."""
+    memory_dir, notes = store
+    # Drop the no-target ghost so today's note is the only one left in place.
+    notes.pop("ghost").unlink()
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_note = memory_dir / "daily" / f"{_today()}.md"
+    today_note.write_text("Session on project/alpha, still in progress.\n", encoding="utf-8")
+    yesterday_note = memory_dir / "daily" / f"{yesterday}.md"
+    yesterday_note.write_text("Session on project/alpha, done.\n", encoding="utf-8")
+    llm = _llm_by_project(alpha=_update_op("a1"), beta=_update_op("b1"))
+
+    with caplog.at_level(logging.INFO, logger="palinode.consolidation"):
+        result = runner.run_consolidation(llm_fn=llm)
+
+    assert result["projects_compacted"] == 2
+    assert today_note.exists()
+    assert not yesterday_note.exists()
+    assert yesterday_note.name in _archived(memory_dir)
+    assert result["notes_today_kept"] == 1
+    assert result["notes_left_in_place"] == 1
+    assert result["notes_archived"] == 4
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+    info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert (
+        f"palinode.consolidation: kept today's daily note in place: daily/{today_note.name}, "
+        "still being written"
+    ) in info
+
+
+def test_dry_run_carries_the_new_keys(store):
+    memory_dir, notes = store
+    loose = _note(memory_dir, "loose", "A reflection that names nobody and nothing.")
+    (memory_dir / "daily" / f"{_today()}.md").write_text("On project/alpha.\n", encoding="utf-8")
+    llm = _llm_by_project(alpha="[]", beta=_update_op("b1"))
+
+    result = runner.run_consolidation(dry_run=True, llm_fn=llm)
+
+    assert result["dry_run"] is True
+    assert result["projects_no_ops"] == ["alpha"]
+    assert result["groups_no_ops"] == 1
+    assert result["projects_all_ops_filtered"] == []
+    assert result["groups_all_ops_filtered"] == 0
+    assert result["notes_no_project"] == 1
+    assert result["notes_today_kept"] == 1
+    assert loose.name in _in_daily(memory_dir)
+    assert not (memory_dir / "archive").exists()
+
+
+def test_nightly_names_zero_op_groups_too(store):
+    memory_dir, notes = store
+    llm = _llm_by_project(alpha="[]", beta=_update_op("b1"))
+
+    result = runner.run_nightly(llm_fn=llm)
+
+    assert result["projects_compacted"] == 1
+    assert result["projects_no_ops"] == ["alpha"]
+    assert result["groups_no_ops"] == 1
+    assert result["projects_all_ops_filtered"] == []
+    assert _in_daily(memory_dir) == {n.name for n in notes.values()}

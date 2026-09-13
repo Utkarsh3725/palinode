@@ -16,6 +16,7 @@ earns its keep by being invisible when it has nothing to say.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -55,11 +56,17 @@ _READ_BODY = {"content": "Full rollback decision body with rationale."}
 
 def _run_hook(tmp_path: Path, *, prompt: str = _PROMPT, env: dict | None = None,
               triggers_response: object = (), search_response: object = None,
-              read_response: object = None):
+              read_response: object = None, resolve_response: object = None):
     """Render the script, run it under bash with a per-endpoint stub curl.
 
     Returns (CompletedProcess, curl_log_path). The stub matches the endpoint
     substring in its argv and cats the corresponding canned response file.
+
+    ``resolve_response=None`` makes ``/resolve`` answer with nothing, which is
+    what a missed deadline looks like to the script — so every search-channel
+    test below is also, deliberately, a fallback test. ``RESOLVE_FAIL=1`` in
+    the env makes only that endpoint fail (a real deadline, exit 28-style),
+    leaving the other channels healthy.
     """
     hook = tmp_path / "hook.sh"
     hook.write_text(USER_PROMPT_SUBMIT_HOOK_SCRIPT)
@@ -71,12 +78,16 @@ def _run_hook(tmp_path: Path, *, prompt: str = _PROMPT, env: dict | None = None,
         json.dumps(search_response if search_response is not None else []))
     (stub_dir / "resp-read.json").write_text(
         json.dumps(read_response if read_response is not None else {"content": ""}))
+    (stub_dir / "resp-resolve.json").write_text(
+        json.dumps(resolve_response) if resolve_response is not None else "")
     (stub_dir / "curl").write_text(
         '#!/bin/bash\n'
         'echo "$@" >> "$STUB_DIR/curl-called"\n'
         '[ "${CURL_FAIL:-0}" = "1" ] && exit 22\n'
         'case "$*" in\n'
         '  *check-triggers*) cat "$STUB_DIR/resp-triggers.json" ;;\n'
+        '  */resolve*) [ "${RESOLVE_FAIL:-0}" = "1" ] && exit 28; '
+        'cat "$STUB_DIR/resp-resolve.json" ;;\n'
         '  */search*) cat "$STUB_DIR/resp-search.json" ;;\n'
         '  */read*) cat "$STUB_DIR/resp-read.json" ;;\n'
         'esac\n'
@@ -120,10 +131,62 @@ def test_search_hits_injected_as_snippets(tmp_path):
     assert proc.returncode == 0, proc.stderr
     ctx = _context_of(proc)
     assert "decisions/deploy-rollback.md" in ctx
-    assert "(62%)" in ctx, "should render raw_score, the knob's scale"
-    assert "(100%)" not in ctx, "must not render the fused rank score"
+    assert "(62% match)" in ctx, "should render raw_score, the knob's scale"
+    assert "(100% match)" not in ctx, "must not render the fused rank score"
     assert "git revert + reindex" in ctx
     assert "Related memories" in ctx
+
+
+def test_a_keyword_only_hit_claims_no_similarity(tmp_path):
+    """raw_score is present and null: a BM25-only hit the ranker marked.
+
+    There is no cosine to report, so the hook reports none. Falling back to
+    the fused value here is the original bug wearing a fallback.
+    """
+    hits = [{"rel_path": "notes/a.md", "score": 1.0, "raw_score": None,
+             "snippet": "body"}]
+    proc, _ = _run_hook(tmp_path, search_response=hits)
+    assert proc.returncode == 0, proc.stderr
+    ctx = _context_of(proc)
+    assert "(keyword match, rank 1.00)" in ctx
+    assert "%" not in ctx.split("### Related memories")[1]
+
+
+def test_an_absent_raw_score_is_not_the_same_as_a_null_one(tmp_path):
+    """A pre-0.12 server never sent the field, so which arm hit is unknown."""
+    absent = [{"rel_path": "notes/a.md", "score": 1.0, "snippet": "body"}]
+    null = [{"rel_path": "notes/a.md", "score": 1.0, "raw_score": None,
+             "snippet": "body"}]
+    a_dir, n_dir = tmp_path / "absent", tmp_path / "null"
+    a_dir.mkdir()
+    n_dir.mkdir()
+    absent_ctx = _context_of(_run_hook(a_dir, search_response=absent)[0])
+    null_ctx = _context_of(_run_hook(n_dir, search_response=null)[0])
+    assert "(rank 1.00)" in absent_ctx
+    assert absent_ctx != null_ctx
+
+
+def test_the_hook_renders_what_describe_match_would(tmp_path):
+    """The hook is a jq copy of palinode/core/scoring.py and must agree with it.
+
+    Same three cases, same wording. The Python surfaces and the hook drifting
+    apart is how one of them starts lying again.
+    """
+    from palinode.core.scoring import describe_match
+
+    cases = [
+        {"score": 1.0, "raw_score": 0.421},
+        {"score": 1.0, "raw_score": 0.425},
+        {"score": 1.0, "raw_score": None},
+        {"score": 1.0},
+        {"score": 0.4},
+        {"score": 0.07},
+    ]
+    hits = [dict(c, rel_path=f"notes/{i}.md", snippet="body")
+            for i, c in enumerate(cases)]
+    ctx = _context_of(_run_hook(tmp_path, search_response=hits)[0])
+    for i, case in enumerate(cases):
+        assert f"[notes/{i}.md] ({describe_match(case)})" in ctx
 
 
 def test_envelope_response_shape_also_accepted(tmp_path):
@@ -160,6 +223,201 @@ def test_total_context_is_bounded(tmp_path):
         env={"PALINODE_HOOK_RECALL_MAX_CHARS": "500"},
     )
     assert len(_context_of(proc)) <= 500
+
+
+def test_the_final_trim_cuts_between_lines_never_inside_one(tmp_path):
+    """The cap lands on a line boundary, so no row arrives half-rendered.
+
+    A raw ``${CONTEXT:0:N}`` cuts wherever the byte count runs out — through a
+    path, through a qualifier, through the middle of a word. Every line that
+    survives here is a line the store actually holds.
+    """
+    body = "\n".join(f"- [notes/n{i}.md] rationale line {i}" for i in range(40))
+    proc, _ = _run_hook(
+        tmp_path,
+        triggers_response=_FIRED_TRIGGER,
+        read_response={"content": body},
+        env={"PALINODE_HOOK_RECALL_MAX_CHARS": "600",
+             "PALINODE_HOOK_RECALL_MAX_RESULTS": "0"},
+    )
+    ctx = _context_of(proc)
+    assert len(ctx) <= 600
+    assert ctx.count("- [notes/") > 0, ctx
+    for line in ctx.splitlines():
+        if line.startswith("- [notes/"):
+            assert re.fullmatch(r"- \[notes/n\d+\.md\] rationale line \d+", line), line
+
+
+def test_a_contested_line_the_trim_cannot_keep_becomes_the_stub(tmp_path):
+    """Cutting a contested row off the end would leave its counterpart alone.
+
+    So it is not cut: the whole block goes and the server's own stub wording
+    takes its place, carrying both pointers. The reader loses the detail, not
+    the knowledge that a conflict exists.
+    """
+    body = "\n".join([
+        *[f"- [notes/n{i}.md] ordinary line {i}" for i in range(12)],
+        "- [insights/region-a.md] frankfurt ⚠ contradicts: insights/region-b.md",
+        "- [insights/region-b.md] dublin ⚠ contradicts: insights/region-a.md",
+    ])
+    proc, _ = _run_hook(
+        tmp_path,
+        triggers_response=_FIRED_TRIGGER,
+        read_response={"content": body},
+        env={"PALINODE_HOOK_RECALL_MAX_CHARS": "600",
+             "PALINODE_HOOK_RECALL_MAX_RESULTS": "0"},
+    )
+    ctx = _context_of(proc)
+    assert len(ctx) <= 600
+    assert "⚠ contradicts" not in ctx, "one side of a conflict survived alone"
+    assert "conflicts omitted for budget" in ctx
+    assert "insights/region-a.md" in ctx and "insights/region-b.md" in ctx
+
+
+# ---- Bounded resolution: the per-turn memory channel ---------------------
+#
+# The routing this hook implements: resolution first, under its own deadline;
+# plain search is the fallback, and it never passes for a resolved answer.
+
+_BUNDLES = json.loads(
+    (Path(__file__).parent / "fixtures" / "resolve_bundles.json").read_text(encoding="utf-8")
+)
+_MARKER = "resolution unavailable (deadline)"
+
+
+def test_resolved_bundle_is_injected_instead_of_raw_hits(tmp_path):
+    """The A → B replacement, resolved: the session is told B, and only B."""
+    proc, curl_called = _run_hook(
+        tmp_path, resolve_response=_BUNDLES["current"], search_response=_SEARCH_HITS)
+    assert proc.returncode == 0, proc.stderr
+    ctx = _context_of(proc)
+    assert "decisions/endpoint-v2" in ctx
+    assert "Production serves traffic from endpoint bravo." in ctx
+    assert "alpha" not in ctx, "the retired wording must never be injected"
+    assert _MARKER not in ctx
+    assert "### Related memories" not in ctx, "resolution replaces the raw-hit channel"
+    assert "/search" not in curl_called.read_text()
+
+
+def test_resolve_request_carries_the_room_that_is_actually_left(tmp_path):
+    """The bundle is budgeted at what remains, not at the whole injection cap.
+
+    The frame (and any trigger section already built) is spent before the
+    bundle arrives; asking for the full cap is how a server that packed a
+    conflict whole gets it cut in half by the hook's own final truncation.
+    """
+    proc, curl_called = _run_hook(tmp_path, resolve_response=_BUNDLES["current"])
+    assert proc.returncode == 0, proc.stderr
+    compact = curl_called.read_text().replace(" ", "").replace("\n", "")
+    assert '"max_items":3' in compact
+    budget = int(compact.split('"max_chars":')[1].split("}")[0])
+    assert 2500 < budget < 3000, f"expected the cap minus the frame, got {budget}"
+
+
+def test_no_room_for_an_honest_answer_is_silence(tmp_path):
+    """Too small to resolve is not an invitation to inject unresolved hits.
+
+    One of those hits may be a side of a conflict; showing it alone is the
+    exact failure bounded resolution exists to prevent, so the channel says
+    nothing instead.
+    """
+    proc, curl_called = _run_hook(
+        tmp_path, resolve_response=_BUNDLES["conflict"], search_response=_SEARCH_HITS,
+        env={"PALINODE_HOOK_RECALL_MAX_CHARS": "200"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""
+    log = curl_called.read_text()
+    assert "/resolve" not in log and "/search" not in log
+
+
+def test_a_conflict_reaches_the_session_with_both_sides(tmp_path):
+    proc, _ = _run_hook(tmp_path, resolve_response=_BUNDLES["conflict"])
+    ctx = _context_of(proc)
+    assert "insights/region-a" in ctx and "insights/region-b" in ctx
+    assert "Contested" in ctx and "no winner" in ctx
+
+
+def test_an_unknown_reaches_the_session_as_unknown(tmp_path):
+    proc, _ = _run_hook(tmp_path, resolve_response=_BUNDLES["unknown"])
+    ctx = _context_of(proc)
+    assert "Unknown" in ctx and "support_withdrawn" in ctx
+
+
+def test_a_budget_omitted_conflict_is_still_injected(tmp_path):
+    """Budget pressure dropped the group from the body — not from the answer."""
+    omitted = dict(
+        _BUNDLES["conflict"],
+        conflicts=[],
+        omitted_conflicts=1,
+        omitted_conflict_refs=[["insights/region-a", "insights/region-b"]],
+        coverage={"status": "partial", "reasons": ["budget_exhausted:conflicts"]},
+        text=("### Resolved from memory (current state)\n\n"
+              "Still contested, omitted for budget (1): "
+              "insights/region-a ↔ insights/region-b\n\n"
+              "Coverage: partial (budget_exhausted:conflicts)"),
+    )
+    ctx = _context_of(_run_hook(tmp_path, resolve_response=omitted)[0])
+    assert "Still contested" in ctx
+    assert "budget_exhausted:conflicts" in ctx
+
+
+def test_deadline_falls_back_to_search_and_says_so(tmp_path):
+    proc, curl_called = _run_hook(
+        tmp_path, search_response=_SEARCH_HITS, env={"RESOLVE_FAIL": "1"})
+    assert proc.returncode == 0, proc.stderr
+    ctx = _context_of(proc)
+    assert _MARKER in ctx
+    assert "### Related memories" in ctx
+    assert "decisions/deploy-rollback.md" in ctx
+    log = curl_called.read_text()
+    assert "/resolve" in log and "/search" in log
+
+
+def test_fallback_body_is_the_pre_resolution_payload_unchanged(tmp_path):
+    """Only the marker is new: the hits below it render exactly as before."""
+    a_dir, b_dir = tmp_path / "deadline", tmp_path / "off"
+    a_dir.mkdir()
+    b_dir.mkdir()
+    fell_back = _context_of(
+        _run_hook(a_dir, search_response=_SEARCH_HITS, env={"RESOLVE_FAIL": "1"})[0])
+    unchanged = _context_of(
+        _run_hook(b_dir, search_response=_SEARCH_HITS,
+                  env={"PALINODE_HOOK_RESOLVE": "0"})[0])
+    assert _MARKER not in unchanged
+    marker_line = [line for line in fell_back.splitlines() if _MARKER in line][0]
+    assert fell_back.replace(f"{marker_line}\n", "") == unchanged
+
+
+def test_resolution_can_be_switched_off(tmp_path):
+    proc, curl_called = _run_hook(
+        tmp_path, search_response=_SEARCH_HITS, resolve_response=_BUNDLES["current"],
+        env={"PALINODE_HOOK_RESOLVE": "0"})
+    assert proc.returncode == 0, proc.stderr
+    log = curl_called.read_text()
+    assert "/resolve" not in log
+    assert "### Related memories" in _context_of(proc)
+
+
+def test_an_empty_bundle_is_silence_not_a_second_opinion(tmp_path):
+    """Resolution answered "nothing" — the search channel does not overrule it."""
+    empty = {"selected": [], "conflicts": [], "replaced": [], "insufficient": [],
+             "omitted_conflicts": 0, "coverage": {"status": "complete", "reasons": []},
+             "receipt_ref": None,
+             "text": "### Resolved from memory (current state)\n\nNothing in memory answers this."}
+    proc, curl_called = _run_hook(
+        tmp_path, resolve_response=empty, search_response=_SEARCH_HITS)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""
+    assert "/search" not in curl_called.read_text()
+
+
+def test_memory_channel_off_skips_resolution_too(tmp_path):
+    proc, curl_called = _run_hook(
+        tmp_path, resolve_response=_BUNDLES["current"],
+        env={"PALINODE_HOOK_RECALL_MAX_RESULTS": "0"})
+    assert proc.returncode == 0, proc.stderr
+    log = curl_called.read_text()
+    assert "/resolve" not in log and "/search" not in log
 
 
 # ---- Silence is the common case -----------------------------------------

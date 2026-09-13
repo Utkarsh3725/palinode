@@ -172,10 +172,15 @@ def test_the_helper_is_no_longer_dead_code():
     """
     import inspect
 
-    source = inspect.getsource(runner._format_active_decisions)
+    source = inspect.getsource(runner._render_active_decisions)
     assert "_get_decisions_for_project" in source
+    assert "_render_active_decisions" in inspect.getsource(runner._format_active_decisions)
 
-    caller = inspect.getsource(runner._consolidate_project)
-    assert "_format_active_decisions" in caller, (
-        "_consolidate_project no longer loads decision context"
+    # The prompt is built in _assemble_prompt, which _consolidate_project calls.
+    builder = inspect.getsource(runner._assemble_prompt)
+    assert "_render_active_decisions" in builder, (
+        "_assemble_prompt no longer loads decision context"
+    )
+    assert "_assemble_prompt" in inspect.getsource(runner._consolidate_project), (
+        "_consolidate_project no longer builds the prompt through _assemble_prompt"
     )

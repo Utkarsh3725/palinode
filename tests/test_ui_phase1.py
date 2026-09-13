@@ -114,6 +114,28 @@ def test_memory_search_returns_hits(client):
     assert "/ui/memory/decisions/searchme" in html
 
 
+def test_memory_search_labels_agreement_separately_from_currency(client):
+    """A file carrying a superseded fact's tombstone: the index is derived from
+    the projected text, so the hit shows the successor only, still matches its
+    source (the raw hash), and no badge reads as currency or verification."""
+    tombstone = (
+        "# Endpoint\n\n"
+        "- ~~Use endpoint A.~~ [superseded 2026-09-12] <!-- fact:endpoint -->\n"
+        "- Use endpoint B. <!-- fact:supersedes-endpoint -->\n"
+    )
+    _seed(client, slug="endpoint", content=tombstone)
+    with patch("palinode.core.embedder.embed", return_value=_FAKE_VECTOR):
+        res = client.get("/ui/memory?q=endpoint")
+    assert res.status_code == 200
+    html = res.text
+    assert "decisions/endpoint.md" in html
+    assert "Use endpoint B." in html
+    assert "Use endpoint A." not in html
+    assert "index matches source" in html
+    assert "⚠ retired" not in html
+    assert "verified" not in html.lower()
+
+
 def test_memory_search_degrades_when_embedder_down(client):
     """A search backend failure renders a soft banner, never a 500."""
     _seed(client, slug="x", content="# X\n\nbody")
@@ -421,6 +443,12 @@ def test_build_quality_view_buckets():
         "missing_descriptions": ["d.md"],
         "contradictions": [{"entity": "projects/p", "issue": "two active"}],
         "no_extraction_meta": [{"file": "s.md"}, {"file": "o.md"}],
+        "stale_backing": [
+            {"file": "insights/b.md",
+             "stale_backing": [{"ref": "insights/a", "op": "supersede"}]},
+            {"file": "insights/b-history.md",
+             "stale_backing": [{"ref": "insights/a", "op": "supersede"}]},
+        ],
     }
     view = build_quality_view(lint)
     keys = {q["key"]: q for q in view["queues"]}
@@ -430,6 +458,10 @@ def test_build_quality_view_buckets():
     assert keys["missing_description"]["rows"][0]["id"] == "d"
     assert keys["contradictions"]["rows"][0]["entity"] == "projects/p"
     assert keys["no_extraction_meta"]["rows"][0]["id"] == "s"
+    # Stale backing: linkable, names the retired source; the history sibling
+    # is filtered out like every other file-bearing queue.
+    assert [r["id"] for r in keys["stale_backing"]["rows"]] == ["insights/b"]
+    assert keys["stale_backing"]["rows"][0]["detail"] == "backed by insights/a (supersede)"
 
 
 def test_recent_commits_repo_wide(tmp_path):

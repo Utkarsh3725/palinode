@@ -225,8 +225,16 @@ def verify_memory_sources(file_path: str, memory_dir: str) -> list[VerifyResult]
     full_path = file_path if os.path.isabs(file_path) else os.path.join(memory_dir, file_path)
     with open(full_path, encoding="utf-8") as f:
         metadata, _ = parse_markdown(f.read())
+    return verify_source_anchors(metadata.get("sources"), memory_dir)
 
-    sources = metadata.get("sources")
+
+def verify_source_anchors(sources: object, memory_dir: str) -> list[VerifyResult]:
+    """Verify already-parsed ``sources:`` anchors against the files they cite.
+
+    The file-free half of :func:`verify_memory_sources`, for callers that hold
+    the frontmatter already (the search freshness annotation parses each hit's
+    file once and must not read it again). ``[]`` when there are no anchors.
+    """
     if not isinstance(sources, list):
         return []
 

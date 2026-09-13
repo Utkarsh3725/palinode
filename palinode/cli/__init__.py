@@ -13,6 +13,7 @@ from palinode.cli.diff import diff
 from palinode.cli.consolidate import consolidate
 from palinode.cli.archive import archive
 from palinode.cli.archive_expired import archive_expired
+from palinode.cli.restore import restore, unretract, forget_withdraw
 from palinode.cli.trigger import trigger
 from palinode.cli.doctor import doctor
 from palinode.cli.manage import reindex, rebuild_fts, split_layers, bootstrap_ids
@@ -23,6 +24,7 @@ from palinode.cli.session_end import session_end
 from palinode.cli.read import read
 from palinode.cli.list_cmd import list_cmd
 from palinode.cli.lint import lint
+from palinode.cli.resolve import resolve
 from palinode.cli.review import review
 from palinode.cli.ingest import ingest
 from palinode.cli.prompt import prompt
@@ -80,6 +82,9 @@ main.add_command(consolidate)
 main.add_command(consolidate, name="dream")
 main.add_command(archive)
 main.add_command(archive_expired)
+main.add_command(restore)
+main.add_command(unretract)
+main.add_command(forget_withdraw)
 main.add_command(trigger)
 main.add_command(doctor)
 
@@ -101,6 +106,7 @@ main.add_command(entities)
 main.add_command(read)
 main.add_command(list_cmd, name="list")
 main.add_command(lint)
+main.add_command(resolve)
 main.add_command(review)
 main.add_command(ingest)
 main.add_command(migrate)

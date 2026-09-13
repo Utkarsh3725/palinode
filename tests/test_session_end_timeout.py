@@ -16,14 +16,16 @@ These tests assert that:
      default curl max-time.
 
 No database, no Ollama, no real API server — these are import-time / static
-source assertions.
+source assertions. The import-time ones run in a subprocess so they never
+reload or evict a ``palinode.*`` module in the test session (the session-end
+test-isolation fix).
 """
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,86 +33,78 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 
 
-# ── 1. Constant integrity ────────────────────────────────────────────────────
+# ── 1–3. Import-time guards, run in a subprocess ─────────────────────────────
+#
+# These assert what a *fresh* import does under a controlled environment. The
+# previous version got its fresh import by deleting ``palinode.cli._api`` and
+# ``palinode.core.defaults`` from ``sys.modules`` and re-importing, which
+# splits module identity for the rest of the session: ``palinode.cli.
+# session_end`` still held the original ``api_client`` singleton while every
+# later ``from palinode.cli._api import api_client`` produced a new one. The
+# e2e fixture then swapped the HTTP client on the new singleton, the CLI
+# command used the old one, and five integration tests failed with
+# ``ECONNREFUSED`` whenever this file ran before them (the session-end
+# test-isolation fix). A subprocess
+# is the only fresh import that leaves the parent interpreter untouched.
+
+
+def _fresh_import(code: str, *, env_override: str | None) -> subprocess.CompletedProcess:
+    """Run *code* in a new interpreter with PALINODE_SESSION_END_TIMEOUT
+    removed (``None``) or set to *env_override*. Quiet config logging so the
+    only stderr worth reading is a traceback."""
+    env = {k: v for k, v in os.environ.items() if k != "PALINODE_SESSION_END_TIMEOUT"}
+    if env_override is not None:
+        env["PALINODE_SESSION_END_TIMEOUT"] = env_override
+    env.setdefault("PALINODE_LOG_LEVEL", "ERROR")
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
 
 
 def test_session_end_timeout_constant_matches_sentinel():
     """SESSION_END_TIMEOUT_SECONDS must equal the sentinel when no env override."""
-    env_key = "PALINODE_SESSION_END_TIMEOUT"
-    prior = os.environ.pop(env_key, None)
-    try:
-        # Force reimport without the override so we get the raw default.
-        import palinode.core.defaults as d
-        importlib.reload(d)
-        assert d.SESSION_END_TIMEOUT_SECONDS == d._SESSION_END_TIMEOUT_SENTINEL, (
-            f"Constant ({d.SESSION_END_TIMEOUT_SECONDS}) != sentinel "
-            f"({d._SESSION_END_TIMEOUT_SENTINEL}); update defaults.py #377"
-        )
-    finally:
-        if prior is not None:
-            os.environ[env_key] = prior
-        import palinode.core.defaults as d
-        importlib.reload(d)
+    proc = _fresh_import(
+        "import palinode.core.defaults as d; "
+        "print(d.SESSION_END_TIMEOUT_SECONDS, d._SESSION_END_TIMEOUT_SENTINEL)",
+        env_override=None,
+    )
+    assert proc.returncode == 0, proc.stderr
+    value, sentinel = proc.stdout.split()[-2:]
+    assert value == sentinel, (
+        f"Constant ({value}) != sentinel ({sentinel}); update defaults.py #377"
+    )
 
 
 def test_session_end_timeout_env_override():
     """PALINODE_SESSION_END_TIMEOUT env var overrides the default at import."""
-    env_key = "PALINODE_SESSION_END_TIMEOUT"
-    prior = os.environ.get(env_key)
-    os.environ[env_key] = "120"
-    try:
-        import palinode.core.defaults as d
-        importlib.reload(d)
-        assert d.SESSION_END_TIMEOUT_SECONDS == 120.0
-    finally:
-        if prior is None:
-            del os.environ[env_key]
-        else:
-            os.environ[env_key] = prior
-        import palinode.core.defaults as d
-        importlib.reload(d)
-
-
-# ── 2 & 3. Module-load drift guards ─────────────────────────────────────────
+    proc = _fresh_import(
+        "import palinode.core.defaults as d; print(d.SESSION_END_TIMEOUT_SECONDS)",
+        env_override="120",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split()[-1] == "120.0"
 
 
 def test_cli_api_module_loads_without_drift_assertion():
     """palinode.cli._api loads cleanly — sentinel assertion does not fire."""
-    # Remove from sys.modules to force fresh import; no env override → must match.
-    env_key = "PALINODE_SESSION_END_TIMEOUT"
-    prior = os.environ.pop(env_key, None)
-    for mod in list(sys.modules):
-        if "palinode.cli._api" in mod or "palinode.core.defaults" in mod:
-            del sys.modules[mod]
-    try:
-        import palinode.cli._api  # noqa: F401 — import for side-effect check
-    except AssertionError as e:
-        raise AssertionError(f"cli/_api.py drift guard fired: {e}") from e
-    finally:
-        if prior is not None:
-            os.environ[env_key] = prior
-        for mod in list(sys.modules):
-            if "palinode.cli._api" in mod or "palinode.core.defaults" in mod:
-                del sys.modules[mod]
+    proc = _fresh_import("import palinode.cli._api", env_override=None)
+    assert proc.returncode == 0, f"cli/_api.py drift guard fired:\n{proc.stderr}"
+    assert "AssertionError" not in proc.stderr
 
 
 def test_mcp_module_loads_without_drift_assertion():
     """palinode.mcp loads cleanly — sentinel assertion does not fire."""
-    env_key = "PALINODE_SESSION_END_TIMEOUT"
-    prior = os.environ.pop(env_key, None)
-    for mod in list(sys.modules):
-        if "palinode.mcp" in mod or "palinode.core.defaults" in mod:
-            del sys.modules[mod]
-    try:
-        import palinode.mcp  # noqa: F401
-    except AssertionError as e:
-        raise AssertionError(f"mcp.py drift guard fired: {e}") from e
-    finally:
-        if prior is not None:
-            os.environ[env_key] = prior
-        for mod in list(sys.modules):
-            if "palinode.mcp" in mod or "palinode.core.defaults" in mod:
-                del sys.modules[mod]
+    proc = _fresh_import("import palinode.mcp", env_override=None)
+    assert proc.returncode == 0, f"mcp.py drift guard fired:\n{proc.stderr}"
+    assert "AssertionError" not in proc.stderr
 
 
 # ── 4. Hook script default curl max-time ────────────────────────────────────

@@ -40,6 +40,12 @@ def prime(cwd, project, fmt):
             # markup=False: digest lines carry [file.md] refs that Rich would
             # otherwise consume as style tags.
             console.print(format_context_digest(data), markup=False)
+            # The delivery receipt's identity for this digest — the handle
+            # that names exactly which records, at which revisions, this
+            # session was primed with. The full receipt is in `--format json`.
+            receipt = data.get("receipt") or {}
+            if receipt.get("bundle_id"):
+                console.print(f"Receipt: {receipt['bundle_id']}", markup=False)
     except Exception as e:
         console.print(f"[red]Error priming context: {str(e)}[/red]")
         raise SystemExit(1)

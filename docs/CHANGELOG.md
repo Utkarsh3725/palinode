@@ -6,6 +6,1445 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [0.20.0] — 2026-09-13
+
+**Compatibility:** the one-time `palinode prompt sync --force` the 0.19.1 notes asked for
+is no longer needed. `prompt sync` compares prompt *bodies*, so the frontmatter the
+pre-0.19.1 cross-reference updater rewrote on store prompts is no longer read as your
+edit: a plain `palinode prompt sync` refreshes those copies and still reports — and
+leaves alone — any prompt whose text you actually changed. Two changes apply without opting in: a memory file under `archive/` is now retired by
+location for recall and consolidation even if its frontmatter says `status: active`; and the
+search index is derived from a current-text projection, so after `palinode reindex` (or the
+incremental reconcile) the struck wording of a superseded or retracted fact no longer matches
+keyword or vector search — read the raw file or its history sidecar for it. `compaction.md`
+is at `version: 5`; `palinode prompt sync` refreshes it.
+
+### Added
+
+- **`docs/UPGRADING-v0.20.md` and `docs/RELEASE-ACCEPTANCE-v0.20.md`.**
+  The operator's view of this release: what changed in plain language, the
+  migration (`palinode reindex`, one pass) with the do-nothing incremental
+  alternative, what rollback does and does not undo, how to tell which projection
+  and policy version a delivery ran under, the fact that no cross-request cache
+  exists and the contract a future one must meet, and an additive-fields
+  compatibility list. The acceptance record carries the measured numbers with
+  confidence intervals, the raw-evidence-versus-consolidation control, the
+  invariant counts, the end-to-end fixtures through the shipped hook, and — at
+  the same level of detail — the four things the run showed do *not* work.
+  `tests/test_migration_v020.py` is the migration's proof: a store indexed the
+  pre-projection way, reindexed, compared row for row against a fresh index of
+  the same files; and the index thrown away and rebuilt, with every retired
+  record still retired, because retirement lives in markdown and git rather than
+  in the index.
+- **`bench/current_state/` — current-state recall measured from memory
+  transitions through agent decisions.** A versioned event corpus
+  (88 episodes across the 20 scenario families, each with a positive and a
+  negative control and a failing coverage gate if either disappears, plus a
+  derived held-out split on unseen projects and paraphrases) replayed through
+  the real indexer, archive/retract operations, deterministic executor and
+  consolidation runner — only the runner's proposal seam is replaced, with a
+  constant, so the corpus contains no model output. Five arms answer the same
+  questions from the same seed retrieval under one token accounting: plain
+  top-k over raw text, the same hits over the current-text projection, bounded
+  evidence plus the resolution policy, the whole `resolve` bundle, and a
+  matched-budget larger-top-k control. Detection, disposition, presentation and
+  agent behavior are scored separately against deterministic oracles, with
+  bootstrap confidence intervals over episodes, before-state checks so
+  abstaining from everything cannot pass a withdrawal case, and hard invariants
+  — no read-triggered mutation, no unauthorized disclosure, no retired value
+  presented as current, and a rebuild-from-files that re-derives the same
+  delivery at the same revisions. Release fixtures drive the shipped
+  `UserPromptSubmit` hook against a live API server. A model-backed reader arm
+  is available behind `--llm-reader`, off by default, endpoint-from-environment,
+  family-stratified, and silent rather than approximate when a scored family
+  has no coverage.
+- **Deterministic age retirement of stale status log lines.** A
+  `projects/<slug>-status.md` fed by session-end gains one dated
+  `- [YYYY-MM-DD] …` line per session; at several hundred of them the weekly
+  compaction could not finish, because doing what the prompt asks — archive
+  aggressively for status — meant one operation with a rationale per line, past
+  any workable token cap, so the pass failed and *nothing* was retired. The
+  weekly pass now retires them itself, before it builds the prompt: dated log
+  lines older than `consolidation.status_log_retention_days` (new, default 90;
+  `0` disables) become ordinary `ARCHIVE` operations through the same executor,
+  keeping every line verbatim in the `-history.md` sibling, with their own
+  commit, one `## Consolidation Log` line naming the range, and an `age_retired`
+  count in the run summary (dry run included). No model is involved — a date is
+  arithmetic, not judgement. Identity and profile documents are never swept:
+  the sweep asks the same document classifier the executor's retirement guard
+  reads, so a `superseded-only` document produces no operations at all.
+  Recognition is by shape and never by section — session-end appends to the end
+  of the file, so the dated lines live *inside* `## Consolidation Log`, below
+  the elision bullet and among the `### <date>` blocks of operation records.
+  What is never a log line: an operation record (`- [UPDATE] …`, any
+  `- [OP_WORD] …`) and the `_[log elided]_` bullet, both being the audit trail
+  *of* retirement; recent lines; undated bullets; a date that is not at the
+  start of the bullet; tombstones; fenced code; anything at or after the
+  auto-footer. `### <date>` headings are untouched. Weekly only; the nightly
+  pass is unchanged.
+- **`ARCHIVE_BEFORE`, a bulk retirement operation.**
+  `{"op": "ARCHIVE_BEFORE", "before": "YYYY-MM-DD", "reason": "…"}` retires
+  every dated log line strictly older than `before` on its target, so a
+  proposal's size follows the number of *reasons* rather than the number of
+  facts. Counted as `archived`, with `archived_by_range` as the sub-count. A
+  malformed or missing date, and a range matching nothing, are dropped as
+  `unmatched` with a warning. Guarded like every other retiring op: refused on
+  a living (`update_policy: replace`) document; refused outright on a
+  `superseded-only` one, since a date range is an age argument and no
+  `superseded_by` can make it anything else; rejected by the propose-side guard
+  when aimed at the auto-footer; in the weekly `allowed_ops` default and
+  deliberately *not* in `nightly.allowed_ops`. `--dry-run` previews the ids it
+  would retire. Contract in `docs/EXECUTOR-SPEC.md`.
+
+- **`palinode lint` flags core memories that have outgrown a gist.**
+  `oversized_core` reports any `core: true` memory whose body exceeds
+  `context.core_gist_max_chars` (default 1500, ~375 estimated tokens) with its
+  size, the limit and the remediation carried on the finding itself — *core =
+  gist + pointer; move detail to the full file*. Core memories are injected at
+  every session start, so their size is spent whether or not anyone wanted it;
+  the detail belongs in the file the pointer names, where recall fetches it on
+  demand. `0` disables the check. PROGRAM.md states the discipline under Core
+  Memory Policy.
+- `palinode doctor` gains `store_tree_clean`: counts modified and untracked files in
+  `memory_dir` via `git status --porcelain` and warns above ten, with the one-step
+  command to commit an existing backlog in its remediation. The complement to
+  `git_remote_health`, which counts unpushed commits and says nothing about
+  uncommitted files — the gap that let the backfill drift below go unnoticed.
+- **Current-text projection for the index.** `palinode.core.projection`
+  is a pure, versioned projection (`PROJECTION_VERSION = 1`) that removes the
+  executor's own retirement renderings from a section's text: a whole line that is
+  a `~~…~~ [superseded YYYY-MM-DD]` / `~~…~~ [RETRACTED YYYY-MM-DD …]` tombstone,
+  and — for the mention-level `[RETRACTED YYYY-MM-DD r:<id>].` strike — just the
+  struck span, keeping the sentences around it. Ordinary Markdown strikethrough,
+  malformed markers, fenced code and inline-code examples are content and stay;
+  unaffected lines are byte-for-byte; frontmatter is untouched; the projection is
+  idempotent. Raw files, `-history.md` sidecars and `git log` are not touched — the
+  retired wording is retrievable from all three and from `palinode_blame`.
+- `palinode doctor` gains `projection_current`: counts indexed chunks whose
+  derived text is on an older projection version (or none) so an operator can
+  watch the migration converge; `palinode reindex` finishes it in one pass.
+- **Bounded evidence resolution on search.** `search` takes an opt-in
+  `resolve` on every surface (CLI `--resolve`, MCP / REST / plugin `resolve`:
+  `none` | `linked` | `full`; default `none`, byte-identical to before). `linked`
+  follows `superseded_by`, `contradicts` and `backed_by` from each hit forward and
+  in reverse — which records name this one, read from the index's stored
+  frontmatter and confirmed against the live file — with cycle detection, so a
+  retired hit surfaces its visible successor without being presented as current
+  and a correction ranked below the top-k still rides on the hit it corrects.
+  `full` adds bounded unlinked discovery: exact lookups first (the hit's
+  `entities` against the entity index, its `sources` / `claims` refs), then a
+  keyword query on its identifiers and a neighbour query on its own stored vector.
+  Every expanded record passes the same path guard and visibility gate the hit
+  passed and carries `currency`, `freshness` and a projected-text excerpt. Each
+  hit gains an `evidence` block (`replacements` / `conflicts` / `support` /
+  `discovered`) with explicit `coverage`: `complete`, or `partial` with reasons
+  from a closed vocabulary (`budget_exhausted:{edges,files,depth,replacement_chain,
+  fallback_queries,fallback_reads}`, `target_hidden`, `target_missing`,
+  `scope_mismatch`, `index_lag`, `fallback_disabled`) that never names a hidden
+  record. Budgets are deterministic and separate — link traversal, replacement
+  chains and discovery each have their own — under `search.evidence` in
+  `palinode.config.yaml`. The resolver is read-only: no file write, no link
+  write, no commit, no recall write-back, and it decides nothing about which side
+  of a conflict wins (`palinode.core.evidence`).
+- **Resolution policy over that evidence.** With `resolve` on, each hit
+  also gains a `resolution` block decided once server-side and only rendered by the
+  surfaces, so the MCP, CLI and REST readings of one hit cannot disagree. Three
+  outcomes, and they stay distinguishable: `supported_current` (the record that
+  stands, with the support that backs it), `unresolved_conflict` (every visible
+  side kept, no winner) and `insufficient_evidence` (unknown as an explicit
+  result). Only mechanically explicit changes resolve — a `superseded_by` chain
+  ending at a standing successor, a declared retirement (archived / deprecated /
+  superseded / retracted), a past `expires_at`. A `contradicts` link, a newer
+  date, an `epistemic: fact` label, a similarity score, a rank position and a
+  recall count can make a conflict *visible* but never retire a record or elect
+  one. A newer proposal does not replace an accepted decision; a decision that
+  disagrees with an observation is reported as `policy_implementation_mismatch`;
+  production and staging observations coexist (scope, namespaced entity kinds and
+  time windows are compared before anything is called a contradiction); a
+  withdrawn replacement yields `insufficient_evidence`, never the value it
+  replaced. Claim kinds come from the existing vocabulary only (`type`,
+  `epistemic`, `status`) and a legacy untyped record stays `unknown`/`undated`
+  rather than being assigned a date or an authority it never declared. Support is
+  grouped by the origin it names (`claims[].source_id` + quote anchor,
+  `sources[].ref`, `backed_by`), so known derived copies count once and unnamed
+  lineage stays `unknown` — matching prose groups nothing. Reasons come from a
+  closed vocabulary (`palinode.core.resolution`).
+- **One canonical bounded-resolution operation, and a hook that consumes it.** `resolve` asks what memory holds *right now* — for a question
+  (`query`) or for one record (`ref`), plus `context` refs the caller already
+  holds, which are checked rather than assumed current. It ships on all four
+  surfaces from one registry entry: `palinode resolve` (CLI), `palinode_resolve`
+  (MCP), `POST /resolve` (REST), and the per-turn recall path in the core plugin.
+  The result is a qualified bundle — `selected` (what stands, each with
+  `currency`, index `freshness`, its raw `content_hash` revision and the refs a
+  follow-up read would use), `replaced` (with successors), `conflicts` (groups,
+  both sides intact, with reasons), `insufficient` (explicit unknowns),
+  `coverage`, `source_revisions`, and `receipt_ref` (reserved, `null` until
+  per-delivery receipts land). Deterministic templates, one renderer in
+  `palinode.core.bundle`, so the three first-party surfaces cannot disagree about
+  what stands. Seeds come from the same `store.search_hybrid` `/search` uses,
+  with the same floor and the same telemetry exclusion, so an exact fact id or
+  slug the vector arm blurs is still found by the keyword arm. No model is
+  involved: with no embedder reachable it seeds from keyword search alone and
+  says `degraded:keyword_only` in coverage. Read-only in both ledgers — no
+  recall metadata and no retrieval-log row, because an operation a per-turn hook
+  calls on every prompt must not inflate `recall_count` or nudge `importance`. **Conflict-preserving packing:**
+  `max_items` / `max_chars` drop *whole units* in priority order (standing
+  assertions, then conflict groups, then replacements, then unknowns); a conflict
+  is never split, and a group that cannot fit is reported by ref with
+  `budget_exhausted:conflicts`, so budget pressure can shrink an answer but never
+  settle a contested one. `max_chars` bounds the rendered bundle, frame included.
+- **Per-turn recall now routes through resolution.** The
+  `UserPromptSubmit` hook `palinode init` installs, and `buildRecallContext` in
+  the core plugin, call `/resolve` for the prompt and inject the rendered bundle
+  under a **250 ms deadline** (`PALINODE_HOOK_RESOLVE_DEADLINE`). Past the
+  deadline the turn falls back to today's search payload byte for byte, prefixed
+  with `resolution unavailable (deadline) …` — never silently, because an
+  unchecked hit presented as a resolved answer is the failure this exists to
+  prevent. `PALINODE_HOOK_RESOLVE=0` restores the pre-resolution channel exactly.
+  Session-start priming is deliberately unchanged and keeps its own payload and
+  budget: a startup digest is orientation, not an answer. Routing among ordinary
+  recall, bounded resolution and explicit follow-up reads is documented in
+  `docs/HOW-MEMORY-WORKS.md` and `plugins/core/README.md`.
+- **Context delivery receipts.** Every delivery now produces a receipt
+  (`palinode.core.receipt`): a bundle id, the policy version it was served under
+  (package + projection + a fingerprint of the policy-relevant config), the
+  server-resolved caller scope, the clock it was evaluated on, the next known
+  temporal transition among the delivered records (earliest `expires_at` or a
+  declared future `date`; `null` when none is known), and — per supplied record —
+  its ref, its **exact source revision** (the raw hash `check_freshness` compares,
+  named by basis so hash domains are never mixed), currency, freshness, span
+  integrity, disposition (`selected` / `replaced` / `conflict_side` /
+  `insufficient` / `evidence_only`) and origin. Known lineage is grouped: a
+  snapshot and a session summary citing one observation's anchor are one group at
+  that observation's revision, not two independent witnesses, and an unanchored
+  record stays `unknown`. It records what was *supplied*, never what influenced
+  anything. `palinode_search` renders the receipt (one line without `resolve`, the
+  full public view with it), `/search` returns it beside the unchanged results
+  array when the request sets `receipt: true`, `/context/prime` returns one for the
+  digest, and the CLI prints the bundle id in text mode. The public view carries
+  refs, hashes and dispositions — never memory text and never the query; the
+  internal diagnostics view carries the request. The existing retrieval log
+  (`.audit/retrievals.jsonl`) carries the receipt fields on each row it already
+  wrote, additively and with no migration, so `palinode trace` now reports which
+  deliveries a file was supplied in, at which revisions, under which disposition.
+  The cross-request reuse contract a future bundle cache must satisfy is recorded
+  and pinned by `receipt.reuse_key` — caller access, query scope, policy version,
+  source revisions and time-sensitive applicability (an unchanged file whose acting
+  state expired at noon changes the key) — without adding a cache.
+- **Explicit backing policy and revalidation receipts.** Two optional
+  frontmatter fields, both absence-is-neutral. `backing_policy: all-of | any-of`
+  is the only thing that lets a checker conclude anything from a multi-source
+  `backed_by` list — `all-of` says the record stands only while every named
+  source does, `any-of` while at least one does, and a list declaring neither
+  stays advisory, exactly as every legacy list is: findings are reported per
+  source and the outcome changes only when all of them are gone. An unreadable
+  value reads as advisory, because a policy that cannot be read must not make
+  the checker more confident. `revalidated: [{ref, revision, at}]` records that
+  a record's author checked a named source at a named revision; a backing counts
+  as revalidated only when that revision equals the source's *current*
+  whole-file SHA-256 (the same `file_sha256` basis a delivery receipt names), so
+  re-saving a dependent — or reformatting it — certifies nothing, and a receipt
+  never revives a source that was retired. Recording the same `(ref, revision)`
+  again is a no-op; a new revision replaces that ref's entry, the previous one
+  staying in git. Where a check should become durable state it rides the
+  existing write-time marker queue as a `revalidate` job, which re-checks
+  against live disk, writes one `stale_backing` entry per finding
+  (`op: revalidate-check`, with the hop and the reason), removes entries an
+  explicit revalidation cleared, re-indexes and commits — no prose rewritten, no
+  `status` changed, and no replacement value ever derived from a source's
+  change. Specified in `docs/EXECUTOR-SPEC.md`; the support cache's reuse test
+  is in `docs/DELIVERY-RECEIPTS.md`.
+
+### Changed
+
+- **The resolve bundle packs through the shared packer, and no consumer slices
+  the result.** `palinode.core.bundle` no longer carries a
+  packing rule of its own: each outcome becomes a `palinode.core.packing.Unit`
+  — assertions, one unit per conflict group (never split), explicit unknowns,
+  and replacements at background priority — and the same `pack()` the
+  session-start digest uses decides what fits. Both caps are enforced now, not
+  just characters: `BundleBudget` gains `max_tokens`, defaulting to
+  `context.recall_max_tokens`, and a token-bound omission is reported as
+  `budget_exhausted:tokens` rather than folded into the character reason. On
+  the consuming side the two client-side string slices are gone: the plugin
+  core exports `trimToUnitBoundary`, and both it and the shipped
+  `UserPromptSubmit` hook cut only between units — a block that does not fit is
+  dropped whole, and a contested block that is cut is replaced by the server's
+  own `⚠ N conflicts omitted for budget — see …` stub, evicting ordinary rows
+  to make room for it. A final character slice is exactly how a payload the
+  server packed honestly arrives with one side of a conflict missing.
+- **Every resolve bundle carries a delivery receipt.**
+  `receipt_ref` is no longer always `null`: the bundle builds its receipt over
+  the records it actually delivered — what stands, what was replaced, every
+  conflict side (including the sides a budget omitted, which the notice names),
+  the explicit unknowns and the support a kept assertion rests on — and returns
+  the public view as a new `receipt` key, with the id also on the rendered
+  `Receipt:` line. Each record carries the disposition the bundle assigned
+  rather than one re-derived from currency, and the revision domain it came
+  from. Building it writes nothing: resolve still records no recall and no
+  retrieval-log row.
+- **Evidence records report the revision they were read at.** An
+  `EvidenceRecord` now carries the SHA-256 of the file the evidence layer read
+  to build it, so a receipt reports `file_sha256` for records carried in an
+  `evidence` block instead of `revision_basis: unknown`. Additive on the
+  evidence payload (one new `content_hash` field per record); the whole-file
+  hash and a search row's indexed per-section hash remain different domains and
+  are never compared.
+- **Compaction prompt v5.** Adds `ARCHIVE_BEFORE` to the operations
+  table and the output example, and tells the model in rule 4 to prefer it for a
+  run of stale dated status lines — a proposal sized by the number of facts is
+  truncated before it can be applied — and that lines already retired by the
+  store's retention policy are not in `EXISTING_FACTS`. Rules 5, 8 and 9 keep
+  their v4 wording and the numbering is unchanged. `palinode doctor`'s
+  `prompts_current` check and `palinode prompt sync` pick the new version up on
+  their own; the v4 body hash stays in the shipped-hash catalogue, so a store
+  still on v4 is recognised as pristine and is refreshed rather than treated as
+  operator-edited.
+- **The session-start digest is budgeted, and truncation never manufactures
+  certainty.** `palinode.core.packing` is a pure packer over *units* —
+  indivisible pieces of an injected payload, each carrying `kind`, `priority`,
+  `refs`, `qualifiers` and its rendered `text`. It packs in priority order and
+  degrades in one direction only: a plain row may be demoted to its gist and
+  pointer, but a unit is never split, a kept unit never loses a qualifier, and a
+  conflict group is kept whole or replaced by one explicit `⚠ N conflicts
+  omitted for budget — see <refs>` stub that keeps every source pointer. A
+  budget can cost you detail; it can never make a contested claim look settled,
+  or an unchecked absence look like a checked "no". Every omission is visible:
+  `Packed.omitted`, `Packed.truncated_reason`, a `_budget` object on the
+  `/context/prime` response, and a WARNING log line — never a silent slice.
+  `build_context_digest` / `format_context_digest` route through it with the
+  digest's existing `MAX_*` count bounds as the packer's input rather than as a
+  second truncation, and with the heading and memory-contract hint reserved so
+  the cap lands on the string a harness actually receives. New config, on the
+  existing `context` block: `injection_max_chars` (6000) / `injection_max_tokens`
+  (1500) for the once-a-session startup payload and `recall_max_chars` (3000) /
+  `recall_max_tokens` (750) for the per-message recall block — budgeted
+  separately because they are paid at different rates; tokens are estimated at
+  4 chars/token and named as an estimate. `0` on both members of a pair restores
+  the previous behaviour byte for byte.
+- **`palinode/prompts/shipped-hashes.json` records body hashes and says so.** `schema: 2` with a `hash_domain: "body"` marker; a palinode that
+  compares whole-file hashes now refuses a body-domain manifest (and vice versa) with a
+  message naming both, rather than matching nothing and calling every store prompt
+  edited. The catalogue is regenerated from every historical blob of the prompt files by
+  `scripts/regen-prompt-hashes.py` — 42 body revisions across the nine prompts — so a
+  prompt bump re-derives it instead of relying on someone remembering to prepend a hash.
+  Regeneration is a union: hashes already recorded are never dropped, because a shallow
+  or squashed clone knows about fewer revisions than the stores in the field do.
+- **The index is derived from the projected text.** `indexer/reconcile.py`
+  applies the projection to each section after the raw parse fixes section ids and
+  raw hashes, so FTS and the vector index see the same current content and a
+  superseded or retracted assertion no longer ranks or renders as current beside its
+  successor. Two hash domains, two columns: `chunks.content_hash` stays a hash of
+  the raw section (what `check_freshness` and quote-anchor verification compare
+  against); `chunks.projected_hash` + `chunks.projection_version` describe the
+  derived text. A chunk on another projection version is re-derived on its next
+  reconcile; a pre-upgrade row whose stored text already equals its projection is
+  stamped in place without re-embedding, so a fresh rebuild and an incremental
+  reconcile converge on the same rows. Cold-embed deferral is unchanged and
+  observable as before. `index_file` reports `chunks_reprojected` and
+  `chunks_stamped` alongside the existing counters.
+
+- Homebrew setup documents a complete local install, stable executable paths for
+  editor connections, and service restarts on upgrade. The tap's release workflow
+  prepares reviewed stable-version updates with installation and upgrade checks;
+  the release runbook verifies Homebrew distribution separately.
+- **Compaction prompt v4.** `specs/prompts/compaction.md` goes from
+  `version: 3` to `version: 4`; the v3 implicit-KEEP contract and the rule numbering
+  are unchanged. Rule 8 now says *never overturn* an ACTIVE_DECISION — the decision
+  wins *for action*, and nothing is superseded, archived or retracted because a
+  decision disagrees with it — and rule 9 names a fact **observed later** than the
+  decision it conflicts with as the PROPOSE_CONTRADICTS case, not a rule-8 case: the
+  link records that the world disagrees, and retires nothing. Rule 5 requires RETRACT
+  to cite its evidence *in context*: the op carries `falsified_by` naming the
+  `category/slug` memory or the fact id that falsifies the retracted one, and the
+  rationale names it too; "known to be incorrect" with no citation is forbidden. The
+  RETRACT row and the Output Format example show `falsified_by`, and rule 10 covers
+  both ref fields. Each RECENT_NOTES entry is now headed by its `(ref: category/slug)`
+  so the model has a note ref it can copy, as it already had for decisions. The rig
+  smoke on v0.19.0 showed the production model answering a dated decision plus a
+  later dated observation with SUPERSEDE and a fabricated RETRACT; `palinode doctor`
+  (`prompts_current`) reports stores still on v3 and `palinode prompt sync` refreshes
+  a pristine copy.
+- The executor's retirement guard now covers `RETRACT` as well as `ARCHIVE`:
+  on a superseded-only (identity / profile) document a `RETRACT` is applied only when the
+  op carries a non-empty `falsified_by` naming the memory or fact in context that
+  falsifies the retracted one — the RETRACT analogue of `superseded_by`. Without it the
+  op is rejected as `protected_rejected`, the reason is logged, the content is unchanged
+  and no history is written. RETRACT on an age-eligible document is untouched, and
+  `SUPERSEDE` still carries its evidence as `new_text`. The v0.19.0 rig smoke showed the
+  production model fabricating a RETRACT ("known to be incorrect", nothing in context)
+  against an identity fact; the guard checks a field, never prose, so determinism
+  holds. The compaction prompt documents the field as well.
+- `bench.abstention` gains `--fts-threshold`, records the resolved BM25 floor in its
+  `parameters` block, and states that floor in the rendered report — so a published
+  abstention run names the floor it ran at instead of implying the configured default.
+  The *BM25 arm contribution* preamble and the `SearchConfig` / `rank_hybrid` docstrings
+  now describe the two arms as having independent floors, which has been true since the
+  relative FTS floor shipped but was still documented as one shared threshold
+  ([#202](https://github.com/phasespace-labs/palinode/pull/202), thanks
+  [@WilliamK112](https://github.com/WilliamK112)). Measured across three seeds at
+  `fts_threshold` 0.4 and 0.0: identical top-5 results at all seven vector thresholds,
+  no control-recall loss, no increase in no-answer hits, BM25 participation steady at
+  45/138 — no observed top-five or control-recall loss on that protocol. Contributor-reported;
+  the override and recorded parameter are what make it repeatable.
+
+### Fixed
+
+- **An unlinked correction now reaches the reader, not only the payload.** The fallback discovery finds a correction that carries no typed
+  link and shares no vocabulary with the record it bears on, and `resolve` put
+  it in the structured bundle — but the rendered `text` printed neither support
+  nor discovery refs, so the per-turn hook injected a string in which the
+  correction was invisible and a reader answered confidently from the record it
+  corrects. A standing assertion now names its declared backing on one
+  `support: <ref>, …` line, and each unlinked record discovery found beside it
+  on a line of its own: `⚠ also found (unlinked): [<ref>] [<currency>] — <≤120
+  character excerpt>`. Both are rendered as indented continuations of the
+  assertion's own unit, so the packer keeps them with it, charges them to the
+  budget, and every consumer's trim cuts on the same boundary. Refs and a short
+  excerpt only — the record itself is one `palinode_read` away. A record with
+  neither support nor discovery renders byte-identically to before.
+- **A contested side now carries its own qualifiers in the rendered text.** A conflict group printed its shared reasons and its sides'
+  statements, but not what qualified each *side* — so a contested pair in which
+  one side rests on a source that was retired out from under it read as two
+  equally supported claims. Each side's row now ends with the same bracketed
+  labels the session-start digest and search results use (`⚠ contradicts:` /
+  `⚠ stale backing:` / `epistemic:`, the two-hop `…@<hop>:<reason>` findings
+  included), rendered by calling the digest's own labeller so the two surfaces
+  cannot drift. The labels are part of the unit the packer measures: a budget
+  that cannot afford them cannot afford the group either, and drops it whole
+  with the notice that names it — never a side stripped of its qualification.
+- **A retired source now reaches the conclusions that rest on it, at both hops.** Retiring a source flagged its *direct* dependents, once, when
+  the retirement fired. A conclusion two hops out stayed unqualified until some
+  later maintenance pass reached it, a source retired after the last pass was
+  never noticed at all, and re-saving a dependent cleared the flag under the
+  convention that the writer had re-verified it — which a whitespace edit
+  satisfied just as well. Every hit, and any replacement that could stand in its
+  place, now gets a bounded read-time support check: each `backed_by` source and
+  each of *their* sources, to `search.evidence.max_support_hops` hops (new,
+  default 2), one read per source, cycle-terminating, charged against the same
+  file budget, with `budget_exhausted:support_hops` in coverage when the walk
+  stopped short. Findings ride the resolution block's qualifiers as
+  `stale_backing:<ref>@<hop>:<reason>` — no new response field — and keep three
+  things apart: support **withdrawn** (the source was archived, superseded,
+  expired, retired by location, or retracted with nothing named as falsifying
+  it — the dependent is uncertain), a **disproven** conclusion (the source names
+  `falsified_by`), and a source that merely **moved** (its revision is no longer
+  the one the record recorded as revalidated — a prompt to re-verify, not a
+  withdrawal). Losing support yields `insufficient_evidence` with
+  `support_withdrawn` or `support_disproven`: never the opposing claim, and
+  never the value the retired source used to carry. A ref no file answers to is
+  coverage (`target_missing`), never a withdrawal — absence is not a retirement;
+  a source the requester may not see contributes `target_hidden` and nothing
+  else. `lint` reports what the check found beside what a retirement persisted,
+  without double-reporting a ref already flagged.
+
+- **A note under `archive/` is retired by location, never presented as current.** The weekly pass and `archive_memory` move a note into
+  `archive/` without rewriting a byte of it, so its frontmatter still said
+  whatever it said when the note was written — and the lifecycle classifier,
+  which read frontmatter only, called it *unmarked*, i.e. usable. Search
+  indexes `archive/` on purpose, so an archived March daily note could be
+  selected as a current assertion by `resolve`. Any `archive` directory
+  segment in a record's path now retires it (reason `path:archive`), ranked
+  below a declared retirement (a note that says `status: archived` is still
+  reported by its declaration) and above everything else, so a note under
+  `archive/` that still claims `status: active` is retired anyway. Nothing
+  under `archive/` is ever unmarked. History stays findable: `archive/` is
+  still indexed, still searchable, and `palinode_read` on an archived file
+  still works — only the lifecycle verdict changed, and `currency` /
+  `currency_reason` now say why.
+- **The store's own prompts are no longer treated as memory.** A provisioned
+  store keeps its editable consolidation prompts at `specs/prompts/*.md`, and five walks
+  tested only a path's *first* segment against a set naming a legacy top-level `prompts`
+  directory — so `specs/…` passed and the prompt files were listed by `GET /list` (and
+  therefore injected by the SessionStart hook), browsable in the provenance UI, in scope
+  for the advisory project review, candidates for the session-start context digest,
+  reachable as `backed_by` dependents, and indexed for search. One shared predicate
+  (`palinode.core.skip_dirs.is_skipped_path`) now answers "is this a memory file?" for
+  all five surfaces and for the indexer, matching every directory segment against a
+  never-memory set (`specs`, `prompts`, `logs`, `.palinode`, `.obsidian`, `.git`) plus
+  whatever each surface adds; `daily`, `archive` and `inbox` stay per-surface, so no
+  other selection changed — the digest still reads `inbox` for open action items. A
+  `palinode reindex` drops prompt chunks an earlier index left behind (the existing GC
+  pass), and nothing reads prompts through the index: every consumer reads the files.
+- **`palinode prompt sync` compares prompt bodies, so a machine-rewritten frontmatter is
+  no longer mistaken for your edit.** A store writes its own prompt
+  frontmatter — the cross-reference updater and the description backfill both rewrote
+  `specs/prompts/*.md` in place — and the whole-file sha256 `sync` compared therefore
+  matched nothing on any store whose watcher had run, reporting all nine prompts as
+  `kept-edited`. The recommended fix was `--force`, the "discard my edits" hatch, which
+  made a real edit and a machine rewrite indistinguishable. Both sides are now hashed
+  frontmatter-stripped, through the same reader consolidation uses to build the system
+  prompt: an added, reordered or requoted frontmatter field leaves a prompt
+  `refreshed`/`unchanged`; one changed line of prompt text is still `kept-edited`;
+  `--force` and the sync provenance commit are unchanged. Stores that only had
+  machine-rewritten frontmatter no longer need the one-time `--force` the 0.19.1
+  compatibility note called for.
+- `palinode doctor`'s `watcher_alive` probed only `systemctl --user
+  palinode-watcher.service`, so a host running the watcher as the **system** unit
+  `palinode-indexer.service` passed via the `ps` fallback and was then told to install
+  a unit it already had — advice that would have installed a second watcher. The check
+  now probes the system manager first and `--user` second, accepts both
+  `palinode-watcher.service` and `palinode-indexer.service` (plus the installer's
+  `WATCHER_UNIT_NAME` override when exported), names the manager and unit that
+  answered, and only suggests installing a unit when none is active under either
+  manager.
+- A write-time `UPDATE` proposal that carries no replacement text is now skipped — logged
+  with the target fact id and counted as `translation_skipped` in the check's
+  `applied_stats` — instead of rewriting the target fact with the whole body of the
+  just-saved memory as its `new_text`. As with the `DELETE` sibling, a
+  multi-line save used to land in the target file as one "fact line" carrying every
+  fact id it contained, duplicating each of them. An `UPDATE` *with* text is applied
+  exactly as before; `new_text` is never derived from the saved body.
+- Overwriting an indexed chunk's text left its **old FTS5 tokens** in the keyword
+  index: `chunks_fts` is an external-content table whose `'delete'` command must be
+  fed the values as indexed, and `write_chunk_row` overwrote the `chunks` row first,
+  so a term that no longer appeared in a chunk kept matching it after any edit. The
+  old tokens are now removed before the row is rewritten (only when the FTS shadow
+  table holds that rowid). Surfaced by the projection migration, where a re-derived
+  chunk still matched the retired wording.
+- A cold-embedder (FTS-only) rewrite of a chunk whose text changed kept the chunk's
+  **previous vector**, so the row read as embedded and the promised re-embed never
+  followed — vector search kept ranking the old wording. An empty embedding now drops
+  the stale `chunks_vec` row, which is the exact signal the reconcile planner
+  re-embeds on once the embedder is warm.
+
+- A write-time `DELETE` proposal that carries no replacement text now translates to the
+  executor's `ARCHIVE` — the target fact is retired into its `-history.md` sibling and
+  nothing is inserted — instead of a `SUPERSEDE` whose `new_text` fell back to the whole
+  body of the just-saved memory. A multi-line save used to land in the target file as one
+  "fact line" carrying every fact id it contained, duplicating each of them. A `DELETE`
+  *with* text still becomes a `SUPERSEDE` with exactly that text; on a superseded-only
+  (identity) document the text-less form is refused by the retirement guard as
+  `protected_rejected`, logged, with the target untouched.
+- **Search freshness is index/source agreement; assertion currency and cited-span
+  integrity are separate, labelled fields.** `check_freshness` compares a
+  chunk's stored section hash against the file on disk, and that is all it can say —
+  a chunk that still carries a superseded fact's `~~struck~~ [superseded …]` tombstone
+  is `valid` because the index faithfully reflects the file. The MCP renderer showed
+  that as `✓ valid`, which read as validation of the assertion. Every search result
+  now carries three answers, kept apart: `freshness` (unchanged field, values and
+  meaning: `valid` | `stale` | `unknown`), `span_integrity` (whether the record's
+  `sources:` quote anchors are still present verbatim in the files they cite, via the
+  `palinode_blame` verifier: `unanchored` | `ok` | `anchor_tampered` |
+  `source_drifted` | `source_missing`) and `currency` (from the lifecycle classifier
+  on the file's *live* frontmatter plus the chunk text: `current` | `retired` |
+  `contested` | `unmarked`, with `currency_reason` naming the deciding signal —
+  `status:archived`, `superseded_by: …`, `retired fact text`, `contradicts: …`).
+  `palinode_search`, `palinode search` (text output, which rendered no freshness at
+  all before) and the UI search list each label them separately —
+  `[index matches source]` / `[⚠ index stale]`, `[⚠ cited quote: source_drifted]`,
+  `[⚠ retired: …]` / `[⚠ contested]` — with no "verified" or "current" wording next to
+  the agreement badge; `current` and `unmarked` are unlabelled, as in the session
+  digest. Compatibility: the existing field is untouched and every consumer of it
+  (`write_time`'s stale check, the JSON output) keeps its meaning; the new keys are
+  additive; stored hashes, the index and the MCP schema are unchanged. Deriving a
+  current assertion text from the history and resolving explicit changes are
+  separate work.
+- **The write-time contradiction check applies its proposal to the file that owns the
+  target fact, and only if that fact is still what it was proposed against.**
+  The check retrieves candidates across every stored memory, but the executor was
+  always run on the just-saved file: a proposal naming a fact in another file was
+  dropped as `unmatched` (the check could never act on the memories it was built to
+  correct), and one naming an id present in both the saved file and a candidate mutated
+  the saved file's copy — the wrong target. Ops are now routed by ownership within the
+  candidate set the model saw; an id carried by more than one candidate file is
+  rejected (`ambiguous_rejected`), and a target whose indexed section hash no longer
+  matches the file on disk — edited between proposal and application — is rejected
+  (`stale_rejected`) rather than overwritten last-write-wins. An id no candidate carries
+  still falls back to the saved file, where the executor reports it `unmatched`. The
+  dedup commit now stages the target's `-history.md` sibling with it (a write-time
+  SUPERSEDE previously left the history entry untracked), and a mutated target is
+  re-indexed in-process so its row is current for the next check rather than waiting
+  on the watcher. Both counters appear in `applied_stats` (`palinode save --sync`, the
+  API's `write_time_check`) whenever ops were routed.
+- **A retired memory is never presented as current, on any surface.** Recall
+  and consolidation input now share one lifecycle classifier,
+  `palinode.core.lifecycle.eligibility`: pure, clock-injected, and speaking only the
+  existing vocabulary (`status` / `lifecycle` archived, deprecated, superseded,
+  retracted; `superseded_by`; `expires_at` on the TTL sweep's clock). A record is
+  *current* (declared live), *retired*, or *unmarked* — a legacy memory with no
+  `status` stays usable and stays unmarked, exactly as an absent `epistemic` is not
+  promoted to `fact`. The session-start digest (`POST /context/prime`,
+  `palinode_session_init`, `palinode prime`) used to select a `status: archived`
+  decision still under `decisions/` as a recent decision and to drop a snapshot's
+  `contradicts`, `stale_backing` and `epistemic` on the way to the row, so a contested,
+  unverified snapshot became an unqualified startup summary. Every digest section now
+  selects through the classifier, and a usable row carries those three qualifiers —
+  as JSON keys on the REST response, and as the same `⚠ contradicts:` / `⚠ stale
+  backing:` / `epistemic:` labels `palinode_search` results use in the MCP and CLI
+  text. "Recent" orders by the record's effective date (declared `date`, else the
+  save path's `last_updated` / `created_at`); a file's mtime is no longer a new
+  effective decision and only breaks ties among undated records, which rank last.
+- **Archived-in-place decisions no longer govern compaction, and retired facts are
+  distinguished from current ones in the propose input.** The compaction
+  prompt's `ACTIVE_DECISIONS` withheld only `status: superseded`, so a decision
+  archived in place was supplied to the model as a governing constraint; it now
+  withholds every retired decision through the same classifier (unmarked legacy
+  decisions remain, as before), and the propose-side guard's `decision_refs` shrink to
+  match. `EXISTING_FACTS` is now exactly the current facts; a bullet the executor
+  already retired in place (`~~struck~~ [superseded …]` / `[RETRACTED …]`) moves to a
+  `## RETIRED_FACTS (… — history, not current state)` block with its id, text and
+  marker intact, so nothing about source identity or history is lost and the guard
+  still counts it as in context. Only Palinode's own markers are recognised — prose
+  strikethrough and a mid-bullet mention strike stay current facts. The executor,
+  `retirement.classify` and the compaction prompt (still v4) are unchanged.
+- **An uncited RETRACT no longer reaches the executor, and no proposal retires an
+  auto-footer link.** The consolidation runner now runs a deterministic
+  propose-side guard on the parsed operations, before the `allowed_ops` filter and
+  before `apply_operations`, in both the weekly and nightly passes. A `RETRACT` whose
+  `falsified_by` (or, when the field is absent, a memory ref or fact id named in its
+  rationale) does not resolve to something that was in the prompt — the EXISTING_FACTS
+  ids, the rendered ACTIVE_DECISIONS refs, the rendered RECENT_NOTES refs — is
+  downgraded to `PROPOSE_CONTRADICTS` linking the fact to the group's latest note,
+  with `(downgraded from RETRACT: no in-context evidence cited)` appended to its
+  rationale; the downgrade is logged and counted as `retract_downgraded` in the run
+  summary (dry-run included). When no note ref exists to link to, the op is dropped
+  under the same count; the RETRACT is never applied. A `RETRACT`, `ARCHIVE` or
+  `SUPERSEDE` whose `id` is a bullet under `<!-- palinode-auto-footer -->` is rejected
+  and counted as `footer_op_rejected`: footer wikilinks are navigation, not claims,
+  and a dogfood weekly pass had applied a RETRACT whose rationale described one fact
+  and whose id was a `[[wikilink]]` bullet under the auto-footer. The guard checks that a citation
+  resolves and nothing more — a citation is necessary evidence, not proof.
+- An explicit `retirement_policy: age-eligible` declaration on a `decisions/` document
+  now overrides the lint proposer's `decisions/` conservatism: `palinode lint --propose`
+  nominates it for a staleness `ARCHIVE` like any other age-eligible document instead
+  of skipping it with `proposer: conservative class (decisions/)`. The conservatism
+  still applies to undeclared decisions, and that skip reason now names the
+  declaration as the way to opt in.
+- **The weekly pass no longer retires notes it never consolidated.** One
+  dogfood run reported `projects_compacted: 1, notes_archived: 65`: 49 of the moved
+  notes carried no `project/` reference at all (so they formed no group and no model
+  read them), 16 belonged to a group that proposed zero operations and was never
+  logged or counted, and one was today's live `daily/<date>.md`, which
+  `POST /session-end` was still appending to — splitting the day and dropping those
+  sessions from the activity gate's `daily/*.md` count. Three rules now hold in
+  `_partition_notes_for_archive`: a note with no `project/` reference stays in place
+  (`notes_no_project`); the current UTC day's daily note is never moved
+  (`notes_today_kept`); and a group that reached the model and came back with nothing
+  — or whose every op the `allowed_ops` filter removed — is a decision, so its notes
+  retire (a quiet store must still drain `daily/`) but the group is named in one INFO
+  line per run and in the summary as `projects_no_ops` / `groups_no_ops` and
+  `projects_all_ops_filtered` / `groups_all_ops_filtered` (both passes, dry-run and
+  real). The left-in-place warning gives each note's reason; today's note, the expected
+  outcome of every mid-day run, is reported on its own INFO line instead. Archival is now gated on
+  any group reaching a decision rather than on `projects_compacted > 0`.
+- The activity gate no longer defers the nightly every other tick. `last_run_at` was
+  stamped at the pass's *completion*, so a daily cron with the default 24 h minimum
+  always arrived a minute short the next day and deferred; the nightly silently became
+  every other night on any store where the pass did real work. The stamp is now the
+  pass's start time, the elapsed floor tolerates one hour of cron jitter (the ceiling
+  does not), and a `partial` pass — a project group failed without raising — no longer
+  resets the clock, so the failed group is retried at the next tick as the docstring
+  always promised.
+- Test isolation: the session-end timeout drift guards ran their fresh imports by
+  evicting `palinode.cli._api` and `palinode.core.defaults` from `sys.modules`, which
+  split module identity for the rest of the session and made five session-end
+  integration tests fail with `ECONNREFUSED` whenever that file ran first. Those checks
+  now run in a subprocess, the e2e fixture asserts the CLI and the fixture share one
+  `api_client` singleton so the failure names itself, and a structural guard fails any
+  test that evicts a `palinode.*` module.
+- Memory-file commits no longer fail on a transient `.git/index.lock` collision. Every
+  writer (save, backfill, consolidation, `bootstrap-ids`, the watcher's cross_refs
+  updates) commits through one helper, and two of them active at once made git refuse
+  the loser with `index.lock: File exists`, which the helper reported as terminal and
+  left the file dirty — a whole-store `bootstrap-ids` racing the watcher stranded 82
+  files that way. The stage-and-commit pair now holds a process-wide lock, so threads in
+  one server never race each other, and a collision with another process is retried
+  five times with a short jittered backoff (worst case about a second) before it is
+  reported. Other exit-128 failures are still terminal on the first try.
+- The deferred description backfill (`POST /generate-summaries`, the watcher's
+  description-fill route) now git-commits what it writes. Both frontmatter injectors
+  were a bare read-modify-write, so a save whose CHAT call was slow got its description
+  later but never a commit; a store with a slow chat host accumulated one dirty file per
+  save while every save reported `git_committed: true`. Touched files are committed in
+  batches of fifty as `palinode backfill: N descriptions, M summaries (palinode
+  <version>)`, so a restart mid-walk strands at most one batch, and the response gains
+  `commits` and `files_committed`. Honours `git.auto_commit: false`.
+- README quickstart step 3 documents `palinode start` alongside the two-process form,
+  with the prose as shell comments so the block survives a copy-paste and with the
+  `PALINODE_DIR` prefix on every command
+  ([#160](https://github.com/phasespace-labs/palinode/pull/160), thanks
+  [@Mayanksuthar07](https://github.com/Mayanksuthar07)).
+- **Diagnostic check results no longer cite unfollowable private issue references ([#205](https://github.com/phasespace-labs/palinode/issues/205)).**
+  `git_commit_ready`, `memory_dir_exists`, and `recall_write_health` carried bare `#NNN`
+  references in their `linked_issue` fields (and in `recall_write_health`'s remediation
+  message) that either pointed at non-existent numbers or resolved to unrelated public
+  issues. These have been cleared to `None` and the remediation message updated. A new
+  AST-based test guard (`test_no_issue_refs_in_diagnostics_strings`) prevents bare issue
+  numbers from being reintroduced into string literals across `palinode/diagnostics/`.
+
+### Removed
+
+### Security
+
+- **The URL ingester vets every redirect hop, and every address a host resolves
+  to.** `is_safe_url` ran once against the submitted URL and `httpx`
+  then followed redirects unchecked, so a public page answering `302 Location:`
+  with an internal address reached that address through `/ingest-url`,
+  `palinode ingest --url`, and the `palinode_ingest` MCP tool. Redirects are now
+  followed by the ingester itself — at most five hops, each one resolved and
+  vetted before it is requested — and the address test is a policy check rather
+  than a list of bad ranges: an address must be globally routable (`is_global`,
+  excluding multicast), which also refuses carrier-grade NAT, 100.64.0.0/10, the
+  range a tailnet lives on. Resolution moved from `gethostbyname` to
+  `getaddrinfo`, so IPv6-only hosts resolve, IPv6 loopback is refused on policy
+  rather than by a failed lookup, and *every* answer is vetted — one internal
+  address among a host's records rejects the host. Rebinding between the check
+  and the connect remains open: `httpx` resolves the name again when it dials.
+  The check runs before each request, not on the connection: the resolved address is
+  not pinned, so a host whose answer changes between the check and the connect is not
+  covered by this guard.
+
+## [0.19.1] — 2026-09-11
+
+**Compatibility:** existing stores refresh `compaction.md` (v3) with `palinode prompt sync`.
+Consolidation prefers prompts in the memory store (`$PALINODE_DIR/specs/prompts/*.md`),
+falling back to the installed package only when a store copy is absent. Upgrading does not
+replace an existing store copy: a store still on v2 keeps asking the model for a verdict on *every* fact, which is
+the output-volume bug this release fixes. `palinode doctor` reports the gap
+(`prompts_current`, store version 2 vs packaged version 3) and `palinode prompt sync`
+performs the refresh, replacing only copies whose content still matches a released version
+and reporting the ones you have edited instead of overwriting them. Two more one-time steps apply to stores that predate this release. A store whose watcher ran before 0.19.1 had its prompt frontmatter rewritten by the cross-reference updater, so `prompt sync` reports every prompt as edited: check `palinode prompt sync --dry-run` and `git log -- specs/prompts` for real edits, then run `palinode prompt sync --force` once. And status documents written before this release carry no fact ids, so consolidation skipped them — and reported success — on every pass: `palinode doctor` (`consolidation_targets_tagged`) names them, and `palinode bootstrap-ids --file` mints the ids for one document (`palinode bootstrap-ids --file projects/<project>-status.md`). Until then the pass skips the document and now says so.
+
+### Added
+
+- **`palinode doctor` names consolidation targets nothing can compact
+  (`consolidation_targets_tagged`).** The runner harvests only bullets
+  carrying a `<!-- fact:id -->` marker, so a target document with body bullets and
+  no markers is inert: every pass over it proposes nothing and reports success. The
+  new `fast` check reads every `projects/*-status.md` (plus the target of any project
+  a recent daily note mentions) and warns with the file name, its untagged-bullet
+  count, and a ready-to-run fix. Documented in `docs/DOCTOR.md`.
+- **`palinode bootstrap-ids --file <rel-path>` tags one memory file.** The
+  whole-store walk is the wrong instrument when `doctor` has named a single inert
+  status document. Same minting, same provenance commit, idempotent; the path is
+  guarded and anything resolving outside the store is rejected. Also available as
+  `POST /bootstrap-fact-ids {"file": "..."}`; a bodyless POST still walks the store.
+
+### Changed
+
+- **The compaction prompt stops asking for a verdict on every fact — KEEP is now implicit
+  (`compaction.md` v3).** v2 said "decide what happens to each fact" and opened its
+  example output with `{"op": "KEEP", …}`, so the response grew with the document: on a
+  449-fact status file the model emitted one KEEP per fact, ran into
+  `consolidation.llm_max_tokens` (2000) after roughly 100 of them, and returned a JSON array
+  with no closing `]`. The parse produced no operations, and a minute-long LLM call was
+  reported exactly like a quiet week. v3 asks for **only the operations that change
+  something** — UPDATE / MERGE / SUPERSEDE / ARCHIVE / RETRACT / PROPOSE_CONTRADICTS — and
+  states that every fact not named in an operation is kept unchanged. Omitted facts
+  retain their existing text.
+  An empty array is now documented as a complete answer meaning "nothing to change", and an
+  explicit KEEP is still accepted and still a no-op — it is simply never required. No judgment
+  rule changed: the ACTIVE_DECISIONS constraint, the no-winner PROPOSE_CONTRADICTS rule, the
+  `category/slug` ref format and the rationale requirement are unchanged, and keep their
+  numbering. Measured on a seeded 300-fact store: the v2-shaped response overruns the token
+  cap and applies nothing, while the v3-shaped response carries the same four judgments in
+  under 900 characters and applies all four. `llm_max_tokens` is unchanged — the point is that
+  the output no longer scales with the document.
+- **`json-repair` is now a declared runtime dependency.** `op_parse` imported it inside an `except` branch to recover malformed model JSON, but it was in neither `pyproject.toml` nor any install — so the documented recovery path had never once run in production, and every malformed proposal fell through to "no operations". Declared rather than deleted: it is pure Python, ~25 KB, MIT, with no required transitive dependencies, and it is the difference between a salvageable proposal and a discarded one. Its test no longer `importorskip`s — a missing module is now a broken install, not a reason to pass silently.
+
+### Fixed
+
+- **`palinode prompt sync` commits the prompts it writes.** The refresh wrote the
+  packaged bytes into `$PALINODE_DIR/specs/prompts/` and returned, leaving the store dirty
+  with no record of which release the prompts came from — and `git log -- specs/prompts` is
+  the only place a store says *when* consolidation started running a given prompt revision,
+  which is when the model's proposals change shape. The written files are now staged
+  explicitly and committed in one commit naming each prompt and the version it now declares
+  (`palinode prompt sync: refreshed compaction.md→v3; added trajectory-extraction.md
+  (palinode 0.19.1)`), recording `--force` when it was used since that is the
+  operator-discarded-edits event worth finding later. `--dry-run` still writes and commits
+  nothing, a sync with nothing to write makes no empty commit, and `git.auto_commit: false`
+  leaves the files uncommitted and says so. The writes go through the store's guarded atomic
+  write primitive, so a prompt path is validated against `PALINODE_DIR` like every other
+  memory write; `--format json` reports `committed` and `commit_message`.
+- **`palinode consolidate` no longer aborts at 30 s while the server keeps running the
+  pass.** The CLI applied its 30 s default request budget to `/consolidate`, but
+  the server gives the model 600 s per project group — so any pass that reached an LLM
+  outlived the command that asked for it, which printed a bare `Aborted!` and exited 1
+  while the API finished the run, held `.palinode/consolidation.lock`, and 409'd the next
+  invocation. `/consolidate` now waits `PALINODE_CONSOLIDATE_TIMEOUT` seconds (default
+  900); `/bootstrap-fact-ids` and `/archive` likewise get budgets that match the work they
+  do. If the wait is exceeded, the CLI reports that the server is still running, names the
+  run lock and where the result lands, and exits 1 — `--format json` emits
+  `{"status": "timeout", "server_still_running": true, …}`.
+- **`palinode_consolidate` (MCP) waits the same budget the CLI does, and reports a timeout
+  instead of failing blank.** The tool posted `/consolidate` with a hardcoded
+  300 s while the server gives the model 600 s per project group — the same failure the CLI
+  had, one surface over: the request gave up, the API kept running the pass and holding
+  `.palinode/consolidation.lock`, and the next call got a 409. The budget now comes from
+  `PALINODE_CONSOLIDATE_TIMEOUT` (default 900), which moved to `palinode.core.defaults` so
+  both surfaces read one value, and on timeout the tool returns the CLI's structured report
+  — `{"status": "timeout", "server_still_running": true, …}` naming the lock, the log and
+  the env var — rather than a bare "request timed out". `palinode_archive` moves 30 s →
+  120 s to match the CLI. The tool description and `docs/MCP-SETUP.md` now say that a long
+  pass can outlast the MCP *client's* own tool-call timeout, which Palinode cannot raise,
+  and that the server finishes the pass regardless.
+- **Consolidation never ran on a store fed by session-end — its status bullets
+  carried no fact ids.** The session-end append to
+  `projects/<project>-status.md` wrote plain `- [YYYY-MM-DD] …` lines, and the
+  runner harvests only bullets with a `<!-- fact:id -->` marker, so a store written
+  exclusively through the supported write paths could never satisfy the runner's
+  precondition. Observed on a real store: 449 untagged bullets, 79 consecutive
+  nightly runs, not one proposal. Session-end now mints the marker on the way in,
+  using the same deterministic id `bootstrap-ids` would produce for that text, so a
+  later backfill is a no-op and nothing is double-stamped.
+- **A skipped consolidation target is counted, not reported as a successful pass.**
+  "Target exists but has no tagged facts" was folded into
+  `projects_compacted: 0` under `status: success`, indistinguishable from a quiet
+  week. Both run summaries now carry `groups_skipped_untagged` and
+  `skipped_untagged_projects` (and count them in `projects_skipped`), the skip is
+  logged at WARNING naming the file and the fix instead of INFO, the cron entry
+  point repeats it as a WARNING, and the group's daily notes are left in place
+  rather than archived as though they had been consolidated.
+- **A consolidation proposal that could not be read is now a failed project, not a quiet week.** Measured on a real store: with a 449-fact status document tagged, the LLM ran for 60 s, emitted per-fact `KEEP` operations, hit `consolidation.llm_max_tokens` mid-id and stopped with no closing `]`. The parser found no array, returned `[]`, and the run summary said `status: success, projects_failed: 0` — byte-identical to a week with nothing to compact. `LLM_FAILED` covered transport failure only. Three changes close it: `OllamaClient.chat_completions` now returns a `ChatCompletionText` (a `str` subclass, so every caller is unchanged) carrying `finish_reason` / `truncated`, read from the OpenAI-shape `choices[0].finish_reason` or Ollama's top-level `done_reason`; `op_parse.parse_result` distinguishes "the model proposed nothing" (`[]`, a legitimate no-op) from "there was nothing readable to parse" (no array, an array that never closed, or one that repaired to no operations); and `_consolidate_project` returns the `LLM_FAILED`-class result for both, with the reason logged at WARNING next to the project name. Such a project is counted in `projects_failed`, named in `failed_projects`, and its daily notes stay in `daily/` for the next run (the note-retention guarantee, on the new failure class).
+- **`palinode prompt list|show|activate` and `GET /prompts` read the store's real prompts
+  directory.** All three went through `GET /prompts`, which listed
+  `$PALINODE_DIR/prompts` — a directory nothing in palinode writes. On a store provisioned by
+  `palinode init` or refreshed by `palinode prompt sync`, the prompts are in
+  `$PALINODE_DIR/specs/prompts`, so `prompt list` printed nothing while consolidation and
+  `palinode doctor`'s `prompts_current` check were reading nine files, and `prompt activate`
+  would have flipped `active:` on a copy no consolidation pass reads. The API now resolves the
+  directory through `palinode.prompts.store_prompts_dir()`, the same helper the runner,
+  `init`, `prompt sync` and the doctor check use. Path-guard behaviour is unchanged.
+- **`prompt sync` no longer sees every store prompt as operator-edited.** The
+  cross-reference auto-updater intended to skip prompts, but tested only the first path
+  segment of a memory's path — and store prompts live at `specs/prompts/*.md`, so they
+  fell through, had their frontmatter rewritten (`cross_refs:`, key ordering) and were
+  committed as `palinode: auto-update cross_refs for specs/prompts/<name>.md`. Since
+  `prompt sync` compares a whole-file sha256 against the hashes palinode has released,
+  one watcher pass over a pristine prompt was enough to make it look edited, and
+  `palinode prompt sync` would then refuse to refresh it without `--force` — leaving
+  the `doctor prompts_current` warning with no working remedy. The skip now matches any
+  directory segment, so `specs/prompts/` is excluded both as a scan source and as a
+  cross-reference target, and the churn commits on prompt files stop. Stores already
+  rewritten need one `palinode prompt sync --force` (back up local prompt edits first).
+
+### Removed
+
+### Security
+
+## [0.19.0] — 2026-09-10
+
+**Compatibility:** existing stores must refresh two prompt files. Consolidation reads its
+prompts from the memory store's `specs/prompts` directory (`$PALINODE_DIR/specs/prompts/*.md`),
+never from the installed package, so a store provisioned before this release keeps its old
+copies and the new `PROPOSE_CONTRADICTS` op — a `contradicts` link between two memories with no
+winner picked — stays unreachable there. Upgrading the package changes nothing until
+`specs/prompts/compaction.md` and `specs/prompts/nightly-consolidation.md` are refreshed from
+this release (`nightly-consolidation.md` goes to `version: 2`; back up local edits first).
+`palinode doctor` now reports the gap instead of leaving it silent: the new `prompts_current`
+check compares each packaged prompt's `version:` frontmatter against the store's copy and warns,
+naming the file and both versions. The new `palinode prompt sync` command performs the refresh:
+it replaces only the store copies whose content still matches a version palinode released, and
+reports the ones you have edited rather than overwriting them. Second change: automatic consolidation now runs behind an **activity gate** by default
+(`consolidation.auto_gate`: both 24 hours elapsed and 5 sessions since the last successful run,
+with a 168-hour ceiling so a store that records no sessions still consolidates weekly). Nothing
+stops consolidating, but a quiet week's nightly pass defers to the ceiling instead of running
+every night; on-demand `palinode consolidate` bypasses the gate, and `auto_gate.enabled: false`
+restores the previous wall-clock schedule.
+
+### Added
+
+- **Retirement is document-relative — age no longer retires identity documents
+  (ADR-020).** A new frontmatter field `retirement_policy:` declares whether a
+  document may be retired by *age* (`age-eligible`) or only by a stated supersession or
+  retraction (`superseded-only`), and a single classifier
+  (`palinode/consolidation/retirement.py`) infers the regime when the field is absent:
+  `people/`, project profile documents (`projects/<slug>.md`, as distinct from their
+  `-status.md` layer), `type: PersonMemory` / `category: person`,
+  `update_policy: replace` and `core: true` are `superseded-only`; daily notes, insights,
+  research, decisions, inbox items and status documents stay `age-eligible`, which is
+  also the fallback, so nothing unclassified changes behaviour. Two age-based paths now
+  consult it: the TTL sweep (`palinode archive-expired`, `POST /archive-expired`,
+  `palinode_archive_expired`) skips a `superseded-only` document whose `expires_at` has
+  lapsed — reported as `skipped_superseded_only` in the result and one log line per sweep
+  with the count and a sample path, which also fixes a `core: true` memory being archived
+  out of recall by the timestamp that was only ever meant to stop it *acting* — and the
+  deterministic executor refuses an `ARCHIVE` op against one unless the op names a
+  successor (`superseded_by`), counting it under the existing `protected_rejected` stat
+  and logging the reason. `superseded_by` is the whole test: naming a successor states a
+  supersession, its absence leaves age as the only argument. `SUPERSEDE`, `RETRACT`,
+  on-demand `palinode archive` with an explicit reason, and `forget` are untouched — the
+  rule is about age, not about retirement. New `tests/test_retirement_policy.py`;
+  `docs/EXECUTOR-SPEC.md` gains a *Retirement Policy Guard* section.
+- `palinode doctor` gains a `prompts_current` check. Consolidation prompts live in the
+  memory store, not the package, so a release that changes one is inert on every store
+  provisioned before it — and nothing told the operator. The check compares each packaged
+  prompt's `version:` frontmatter against the store's copy of the same filename and **warns**,
+  naming the file and both versions, when the store lags, differs, or is missing the file
+  outright; it passes when they match, and declines with the path it looked at when the store has
+  no `specs/prompts/` or the install has no packaged prompts to compare against. Tagged `fast`,
+  so it reaches the MCP `palinode_doctor` tool and `GET /doctor?fast=true` as well as the CLI.
+  Documented in `docs/DOCTOR.md`; the release's compatibility warning above is its companion.
+- `palinode lint --propose` closes the lint→consolidation loop: the deterministic
+  findings become consolidation operations carrying their rationale and the finding they came
+  from — stale document → whole-document `ARCHIVE`, deep-check contradiction pair →
+  `PROPOSE_CONTRADICTS` on both sides, withdrawn `backed_by` and orphans → advisory
+  `PROPOSE_UPDATE`, relative dates left to the date-normalisation pass. Dry run by default;
+  `--apply` runs the applicable ones through the existing deterministic writers with an actor
+  of `lint`, so the history sibling (`[actor: lint]`) and the commit subject distinguish them
+  from LLM-proposed operations. Also `POST /lint?propose=true` (with `apply=true`,
+  `deep_contradictions=true`) and a `propose` argument on the `palinode_lint` MCP tool, which
+  stays read-only — `apply` is CLI/API-only. Age-based `ARCHIVE` is never proposed against a
+  document the ADR-020 classifier calls `superseded-only`, is withheld from `decisions/` as
+  proposal-side conservatism (see *Changed*), and honours `consolidation.allowed_ops`. `lint` is promoted from the parity registration
+  backlog into the registry with `propose` as its canonical parameter.
+- Relative dates are normalised at write time and linted after it. `PROGRAM.md`
+  has required absolute dates since v0.16.0 and nothing enforced it. Session-end now
+  resolves day-precise relative phrases in the summary and the decision/blocker bullets
+  against the session date — "yesterday" becomes "on 2026-09-09" — and refuses everything
+  it cannot rewrite honestly: quoted text, blockquotes, fenced and inline code,
+  possessives, vague phrases ("recently"), and intervals ("last week", "three weeks ago"),
+  which name a span rather than a day. Off with `write.normalize_relative_dates: false`.
+  `palinode lint`'s `relative_dates` check now reports the resolution beside the phrase —
+  the absolute date derived from the memory's `created_at` or its dated filename, or
+  `unresolvable` with the reason — on the text, JSON, API and MCP surfaces, and skips ISO
+  dates, dated bullets, code and already-anchored phrases. A resolvable finding on a fact
+  line becomes an `UPDATE` under `palinode lint --propose`, with the phrase and the anchor
+  in its rationale; everything else is recorded as skipped with the reason.
+- Activity-gated automatic consolidation. The cron entry point no longer
+  consolidates on the calendar alone: a pass runs only when both **≥
+  `consolidation.auto_gate.min_hours_elapsed`** (24) have passed **and**
+  **≥ `min_sessions`** (5) session-end entries have been recorded since that pass last
+  ran, with a `max_hours_elapsed` ceiling (168 h) that fires regardless so a
+  watcher-only store still consolidates. Enabled by default; a deferral exits 0 and
+  logs one line naming both thresholds, so the cron can be scheduled hourly. Weekly and
+  nightly are gated independently from
+  `<memory_dir>/.palinode/consolidation-state.json`; sessions are counted from the
+  `## Session End —` entries in `daily/`. On-demand runs bypass the gate —
+  `palinode consolidate --respect-gate`, `respect_gate` on `POST /consolidate` and
+  `palinode_consolidate`, and `--ignore-gate` on the cron path opt in or out
+  explicitly. Gate state is reported on `/status` under `consolidation_gate`.
+
+### Changed
+
+- **`palinode lint --propose` now reads the ADR-020 retirement classifier instead of its own
+  copy of the rule.** The deterministic proposer and the executor's retirement
+  guard shipped in the same release with two separately maintained lists of what an identity
+  document is, and they already disagreed. The proposer now asks
+  `retirement.is_superseded_only()` — the one classifier the guard and the TTL sweep read — so
+  the two cannot drift, and keeps only a short, labelled list of its own: `decisions/`, which
+  ADR-020 calls conservative rather than forbidden, is still not nominated, as a *proposal-side*
+  preference and not an invariant. Two behaviour changes fall out: a stale
+  `projects/<slug>-status.md` is now proposed for `ARCHIVE` (status documents are the one regime
+  ADR-020 explicitly ages out; only `projects/<slug>.md`, the profile document, is protected),
+  and a document declaring `retirement_policy: age-eligible` is proposable even under `people/`.
+  Each skipped finding now names the layer that stopped it —
+  `retirement_policy: superseded-only (<signal>)` versus `proposer: conservative class` — so a
+  report says whether an exclusion is the executor's rule or the proposer's caution.
+  `docs/EXECUTOR-SPEC.md` § *Proposers and the `lint` Actor* states the layering.
+
+### Fixed
+
+- The cross-surface parity registry can now say that a canonical param is *realized as its own
+  capability* on a surface, instead of recording that arrangement as temporary drift.
+  `Operation.surface_realizations` names the realizing capability, the parity test passes on
+  those entries rather than xfailing, and `registered_capabilities` counts the capability as
+  registered so it needs no `INVENTORY_BACKLOG` row. `depends`/`unblocked` — realized as
+  `GET /depends/_unblocked` — was the only such case, and its three stale references to a
+  private-tracker issue number are gone. A new guard asserts every declaration names a real
+  canonical param *and* a capability live on that surface
+  ([#204](https://github.com/phasespace-labs/palinode/pull/204), thanks
+  [@chiruu12](https://github.com/chiruu12)).
+- **`PROPOSE_CONTRADICTS` is reachable — the executor op no model could propose.**
+  The op that records a `contradicts` link between two memories *without* picking a winner
+  shipped in v0.9.0, was covered by tests, and was named in **no prompt**, so no model was
+  ever told it exists and it had never run once. `specs/prompts/compaction.md` and
+  `specs/prompts/nightly-consolidation.md` now name it with its contract (conflict with no
+  clear winner → propose the link, never SUPERSEDE or ARCHIVE) and its JSON shape, and it is
+  in the default `consolidation.allowed_ops` / `consolidation.nightly.allowed_ops` — the
+  second gate, which silently dropped the proposal even once the prompt asked for it.
+  `contradicts` takes `category/slug` memory refs, so the compaction prompt's
+  `ACTIVE_DECISIONS` context now renders each decision's ref alongside its title: a conflict
+  the model can see but cannot name is one it cannot record. Measured on a seeded store with
+  two conflicting facts (`6340` vs `6341`) and a governing decision: **before**, both a local
+  4B instruct model and a 32B instruct model picked a winner they had no basis to pick
+  (`ARCHIVE`, `RETRACT`); **after**, both proposed exactly
+  `{"op": "PROPOSE_CONTRADICTS", "id": "port-b", "contradicts": ["decisions/api-port"], …}`,
+  which applies to a `contradicts:` frontmatter link with both facts still live and no
+  history sibling. Reachable is not the same as chosen: on the dev rig, the production
+  coder model given a governing decision plus a later conflicting observation still picked
+  the decision as winner every time (the prompt's "the decision wins" rule dominates the
+  no-winner rule); the executor path is proven on a real store, and the prompt tuning is
+  tracked for a future release. No new surface — `lint` (`open_contradictions`), `trace`, and the search
+  result marker already show the link. A pass whose only outcome was a contradiction link
+  also committed `0u 0m 0s 0a` ("nothing happened"); the commit summary now carries the
+  count. New `tests/test_prompt_op_vocabulary.py` asserts every executor op is named in at
+  least one prompt (the generalizable guard for this whole class) and
+  `tests/test_propose_contradicts_seam.py` drives the propose→dispose seam end to end on a
+  real store. `specs/prompts/compaction.md` also gains the frontmatter block every other
+  prompt carries and declares `version: 2` (v1 named the six reachable ops, v2 adds this
+  one), so the `prompts_current` doctor check can report a store still running the old
+  contract; the consolidation loader now strips prompt frontmatter before the text reaches
+  the model, which it never did — the nightly prompt's YAML block was being sent as part of
+  its instructions.
+- Consolidation: a `MERGE` whose `new_text` equals the surviving fact's current
+  text is now applied as a merge instead of aborting as a no-op — `ids[0]` is
+  left byte-identical and every `ids[1:]` line is retired to `-history.md` with
+  the standard merge record. Previously the duplicate stayed in the file, no
+  history was written, and the status document's Consolidation Log still
+  claimed a `[MERGE]`. That log line is now gated on the executor's outcome, so
+  a dropped, unmatched, or nightly-rejected `MERGE` leaves no line.
+
+- **The prompts are in the wheel, and `init` writes them into the store.** A
+  `pip install palinode` shipped no consolidation prompts at all: `specs/prompts/*.md` sits at
+  the root of the source tree, entered no distribution, and the runner read
+  `<memory_dir>/specs/prompts/compaction.md` with a bare `open()`. So the advertised path —
+  install, `palinode init`, save, `palinode consolidate` — ended in `FileNotFoundError`, and
+  every store that worked had been cloned from a checkout. The prompts now ship as package data
+  under `palinode/prompts/` (`tests/test_packaged_prompts_match_source.py` pins them
+  byte-identical to `specs/prompts/`, which stays the source of truth), reachable through one
+  accessor. `palinode init` provisions them into `$PALINODE_DIR/specs/prompts/` — never
+  overwriting an existing file, not even under `--force`, since a tuned prompt is not
+  scaffolding; `--no-prompts` opts out and `--dry-run` lists them. The runner prefers the
+  store's copy, falls back to the packaged one with a single INFO line naming it, and raises
+  when neither exists rather than returning the empty-operations result that a run summary
+  cannot tell apart from a quiet week. Both read sites go through the frontmatter-stripping
+  loader, so a packaged prompt's YAML block never reaches the model either. `prompts_current`
+  now compares against the packaged copies inside the install, so it works on a wheel — where
+  it previously reported "no packaged prompts to compare against", which is how this was found.
+  New `palinode prompt sync` refreshes stale store copies: palinode ships the sha256 of every
+  prompt revision it has released, so a store copy whose hash is in that list is provably
+  untouched and safe to replace, and anything else is reported as `kept-edited` and left alone
+  (`--force` to override, `--dry-run` to preview). The `wheel-smoke` CI job now installs the
+  wheel, inits a store, saves a memory and runs a dry consolidation, so the whole path is
+  covered where an editable install cannot see it.
+
+### Removed
+
+### Security
+
+
+## [0.18.0] — 2026-09-09
+
+**Compatibility:** keyword recall changes. The BM25 arm of hybrid search now OR-joins the
+content words of a query (stopwords dropped; an identifier such as `CVE-2026-31889` stays an
+exact phrase), where FTS5's implicit AND previously required every word of a question to
+co-occur in one chunk. Natural-language queries reach the keyword arm for the first time, so
+`palinode search`, `/search`, and `palinode_search` can return keyword hits they never did
+before — and a query of several unrelated words now matches chunks carrying any of them,
+ranked by how many. The FTS arm also gets its own relevance floor, `search.fts_threshold`
+(default 0.4), **relative to the best keyword match** — the cosine `threshold` no longer
+applies to keyword scores, so keyword hits that were silently discarded before fusion at the
+default MCP/API thresholds now reach the results: an identifier query (`CVE-2026-31889`,
+a ticket or PR number) can
+return its chunk where it previously returned only vector neighbours. Fusion is unchanged.
+
+### Added
+
+- `bench/longmemeval_v2/` — a fifth extraction note kind, `form_schema`: one
+  structured note per form the agent saw (fields with type / required / default, sections,
+  buttons), rendered as a table so "which field is mandatory" is a lookup. The a11y digest
+  now keeps the `required` / `checked=` / `disabled` / `readonly` markers it is read from.
+  `reextract.py` runs a second extraction pass over a saved raw store — new notes, same
+  embedded slices — so a prompt change costs hours of extraction, not a rebuild.
+
+### Changed
+
+- `docs/BENCHMARKS.md` → *LongMemEval-V2* gains *Extraction grain: a form-schema note kind*
+ : the second extraction pass measured against the first on both domains.
+  Negative result — enterprise static −6.8 (an off-target form schema makes the reader
+  abstain on multi-form questions; 14 schemas per 100 trajectories), web inside the noise
+  floor. Artifacts under `bench/results/longmemeval-v2-*-formschema-2026-09-06/`.
+- `docs/BENCHMARKS.md` → *The BM25 arm, measured* carries the three-seed replicate of the
+  keyword-arm fix: stock path 41.7 → 48.2 on LongMemEval-V2 web (ranges 40.8–42.5 vs
+  47.5–49.6, disjoint), with the seed-to-seed spread stated as the noise floor. Four more
+  rows under `bench/results/`.
+
+### Fixed
+
+- The embed preflight no longer drops the first embed of every process.
+  `check_model_context` read Ollama's `/api/show` `parameters` field as a mapping, but
+  current Ollama returns it as a newline-delimited `key value` string, and the fallback was
+  evaluated eagerly — so the first embed in the API server and in the watcher raised
+  `AttributeError`, the inline index of the first save after a restart was lost, and the
+  watcher's first file was dropped for good (its retry is the same process). The field is
+  now parsed, `bert.context_length` (bge-m3 is a BERT model) counts alongside
+  `llama.context_length`, the runtime `num_ctx` wins over the architecture capability when
+  both are present (a model that reports 8192 but runs at 4096 truncates at 4096, and the
+  warning now says so), and a raise anywhere inside the preflight costs one warning line
+  instead of the payload. Found by the release-gate smoke; the unit fixtures had modelled
+  `parameters` as a dict.
+- An embed input that Ollama's GPU path rejects with a NaN vector is retried once on the
+  CPU path (`options.num_gpu: 0`, `keep_alive: 0`) before the chunk degrades to
+  keyword-only. The cause is a flash-attention precision bug in llama.cpp on
+  cacheless encoders such as `bge-m3` (upstream open); the same input embeds correctly on
+  CPU. `keep_alive: 0` is deliberate — without it a long server-side keep_alive leaves the
+  model CPU-resident for every later caller. `embeddings.primary.nan_cpu_retry: false`
+  restores the previous behaviour; Ollama dialect only.
+- Correct keyword hits were discarded before fusion at the default thresholds.
+  `rank_hybrid` floored the FTS arm at the caller's *cosine* threshold (0.4 MCP / 0.5 API),
+  but normalised BM25 is on a different scale that also moves with corpus size: on a 54-pair
+  rig only 43 % of true keyword hits cleared 0.4, and every single-identifier hit
+  (`CVE-…`, `SOW-…`, issue numbers) sat at 0.12–0.13. The FTS arm now has its own floor,
+  `search.fts_threshold` (default 0.4), **relative to the best keyword match in the result
+  set** — the true chunk is that match in 51/54 rig pairs and within 0.49× of it otherwise;
+  distractors sit at a median 0.39×. Against a copy of a live 11.8k-chunk store at MCP
+  defaults, an identifier query's chunk reached the top-10 for 16/20 identifiers (was 6/20;
+  vector-only 1/20) and 10/20 as a question (was 7/20). `fts_threshold=0.0` disables the
+  FTS floor; FTS-only rows (no vector) stay exempt as before. Documented in
+  `palinode.config.yaml.example`. The defect was filed independently as
+  [public #199](https://github.com/phasespace-labs/palinode/issues/199) by
+  [@WilliamK112](https://github.com/WilliamK112), whose
+  [#202](https://github.com/phasespace-labs/palinode/pull/202) carries the absolute-floor
+  variant and its acceptance run.
+- Hybrid search was effectively vector-only for natural-language queries: FTS5's
+  implicit AND meant *"why does consolidation skip groups?"* required all five words in one
+  chunk and the BM25 arm returned nothing — 0 of 30 sentence queries matched when the arm
+  was first measured, and on LongMemEval-V2's exact-label questions the empty arm cost 5.8
+  points against an OR-joined one. `store.fts_match_expression` now builds the MATCH
+  expression: content words OR-joined, identifiers kept as phrases, BM25 ranking by terms
+  matched. Verified on the same row: the stock path goes 42.5 → 47.5, within noise of the
+  benchmark adapter's own OR arm (48.3); row in `docs/BENCHMARKS.md`. The score
+  normalisation and per-arm threshold questions from the same issue stay open.
+- `palinode.config.yaml.example` now keeps every documented scalar value aligned with
+  its corresponding dataclass default, except for the explicitly documented schedule
+  and database-path representations. New installs that copy the example therefore use
+  the measured `api_threshold` of 0.5 and the current default result limit of 15
+  ([#201](https://github.com/phasespace-labs/palinode/pull/201),
+  thanks [@WilliamK112](https://github.com/WilliamK112)).
+
+### Removed
+
+### Security
+
+## [0.17.0] — 2026-09-07
+
+**Compatibility:** The OpenClaw plugin manifest (`plugin/openclaw.plugin.json`, plugin
+0.2.0) now declares `recallProfile` and `midTurnMode` as closed enums and rejects unknown
+keys, so a config with a misspelled profile or an unrecognised key **fails to load** with a
+named error where it previously fell back to defaults silently. Check
+`plugins.entries.<id>.config` against `plugin/INSTALL.md` before upgrading. The MCP full tool
+surface grows from 29 to 32 (`palinode_restore`, `palinode_unretract`,
+`palinode_forget_withdraw`); a client that pins the tool count needs the new number.
+
+### Added
+
+- `docs/CLI.md` — a command reference with one entry per `palinode` command: synopsis,
+  purpose, options with defaults, an example, and which output pattern the command follows
+  (TTY-aware `--format`, `--json` flag, or text only). The 18 commands no shipping doc named
+  (`prime`, `entities`, `review`, `repair-status`, `retrieval-stats`, the embedding tools,
+  `config`, `ingest`, `prompt`, and the operator-maintenance commands) are now documented, along
+  with `restore`, `unretract`, `forget-withdraw`, and `trigger add --expires-at/--authority`.
+  `tests/test_cli_reference_docs.py` keeps the page and the registered click commands in sync in
+  both directions. `HOW-MEMORY-WORKS.md` now points at `palinode prime` and `palinode entities`
+  from the sections that explain them, and `OPERATIONS.md` gains a `repair-status` recovery
+  scenario. README: the tool-to-CLI naming sentence no longer implies `doctor_deep` and
+  `session_init` are CLI commands; QUICKSTART: `init --obsidian` takes `--dir`, not a positional
+  path.
+- **`backed_by` propagation — retiring a source flags its dependents for review.**
+  `backed_by` is now an extension edge with propagation semantics:
+  when a memory that other memories cite as their source has a fact superseded,
+  archived, retracted or merged away by the consolidation executor, or is
+  archived/superseded or retracted on demand, every live dependent gains one
+  `stale_backing` frontmatter entry naming the source ref, the retirement kind,
+  the retired fact ids, the reason and a timestamp. Flag only — the dependent is
+  never rewritten, archived or retracted; it stays in recall, visibly contested.
+  Written by the deterministic path (never the LLM), one hop, idempotent per
+  source, committed with provenance as its own commit, and cleared by re-saving
+  the dependent (the save path rebuilds frontmatter from its inputs, so a re-save
+  is the re-verification). Surfaces: `lint` reports `stale_backing` on every
+  surface, the `/ui/quality` page gains a *Stale backing* queue (counted in the
+  sidebar badge), the advisory review proposes a `PROPOSE_UPDATE` per flagged
+  memory, `palinode_search` results carry `⚠ stale backing: <ref>`, and the
+  executor stats gain `review_flagged`. `contradicts` stays an association
+  edge and never propagates. New `palinode/consolidation/propagate.py`;
+  contract in `docs/EXECUTOR-SPEC.md` § Dependency propagation.
+- **Archival and retraction are reversible on every surface.** `palinode restore <file>`,
+  `POST /restore`, the `palinode_restore` MCP tool and the plugin core's `restoreMemory()` are
+  the inverse of every archive path (on-demand, forget request, TTL expiry, consolidation):
+  `status` flips back to `active`, `superseded_by` is dropped, and the frontmatter is
+  reconstructed from the archived file itself — `created_at` and every other field survive —
+  with `restored_at` / `restored_from` provenance, a `-history.md` line, and one commit. Restore
+  does not resurrect what it did not archive: retraction markers, `retracted_prefs`, and
+  triggers are separate lifecycle state. `palinode unretract <file> <pref>` / `POST /unretract` /
+  `palinode_unretract` / `unretractMentions()` is the inverse of a mention-level retraction —
+  un-strikes exactly the pref's own `[RETRACTED … r:<id>]` spans and clears its `retracted_prefs`
+  entry. `palinode forget-withdraw <request>` / `POST /forget-withdraw` /
+  `palinode_forget_withdraw` / `withdrawForgetRequest()` takes a forget request back by composing
+  the two over the request's targets and archiving the request record(s). All three are
+  registered in `palinode/core/parity.py`. **Re-trigger safety:** a forget request now resolves
+  only against memories that existed when it was first made — the boundary is the request
+  memory's own `created_at` (preserved across re-saves) or the earliest live request record for
+  the same pref, and a restored memory's `restored_at` counts as its creation — so a re-saved
+  request (a SessionEnd floor-hook re-capture, a session summary landing on the same slug twice)
+  can no longer archive a pref memory created after the original resolution. Same-pref request
+  records are never targets. The save result reports `resolved_before` and `prior_requests`.
+- `expires_at` + `authority` on the two state types that act. Triggers gain
+  both as columns (migration is additive; existing rows read back `NULL` and never
+  expire) and as `palinode_trigger create` / `trigger add --expires-at --authority` /
+  `POST /triggers` parameters; `check_triggers` skips an expired trigger and logs it
+  once per process, and the `archive-expired` sweep flips it to `enabled: 0`. A
+  `core: true` memory past its frontmatter `expires_at` is withheld from
+  `GET /list?core_only=true` and `/context/prime` — every injection surface — while
+  staying listed, readable, and searchable. `authority` is free text, stored and shown,
+  not enforced. `palinode lint` reports core memories with no `expires_at`. Gate lives
+  in `palinode/core/expiry.py`.
+- `embeddings.primary.dialect: ollama | openai` — the embed client can now speak
+  the OpenAI-compatible `/v1/embeddings` shape, so llama.cpp (`llama-server --embedding`),
+  vLLM, and LM Studio can serve as the embedding backend. Default `ollama` leaves existing
+  deployments untouched; an unknown value fails config load. The `openai` path is one POST of
+  `{model, input}` under the same EMBED-role circuit breaker, retry/backoff, and structured
+  logging as the Ollama path; responses are validated whole and re-ordered by `index`; a
+  server 400 or llama.cpp's "input is too large to process" 500 maps to the per-input
+  `EmbeddingInputError` (chunk stays FTS-only, re-embedded next pass) rather than an outage;
+  a `url` ending in `/v1` is not doubled; the Ollama-only `/api/show` preflight is skipped.
+  Documented in the README and the example config; no bearer-token support (the chat role's
+  OpenAI path has none to mirror either).
+
+### Changed
+
+- `docs/BENCHMARKS.md` → *LongMemEval-V2* gains *The BM25 arm, measured*: the store's stock
+  implicit-AND FTS path against the adapter's OR-joined arm on the same web store — 42.5 vs
+  48.3, 27 lost / 13 won, single seed. The BM25 arm carries recall on exact-label questions;
+  the earlier LongMemEval-S conclusion that the vector arm covers it does not transfer.
+  Artifacts under `bench/results/longmemeval-v2-*-ftsand-2026-09-05/`.
+- `palinode/cli/_api.py`'s 35 API-adapter methods now carry return annotations matching each
+  endpoint handler's own type — 24 `dict[str, Any]`, 7 `list[dict[str, Any]]`, 3 `dict[str, str]`,
+  and a `list[…] | dict[…]` union on `get_entities` — instead of no annotation at all
+  ([#194](https://github.com/phasespace-labs/palinode/pull/194), thanks [@Saket7002](https://github.com/Saket7002)).
+- `bench/abstention.py` now separates the two search arms: each observation records the ordered
+  result keys and how many results reached the merged set through BM25 alone, `compare_arms`
+  distinguishes a reorder from a membership change at each floor, and the Markdown report gains
+  a *BM25 arm contribution* section with the normalized BM25 candidate scores per seed. The
+  counted metrics were blind to ordering, so the vector and hybrid rows were identical wherever
+  BM25 changed rank but not membership
+  ([#197](https://github.com/phasespace-labs/palinode/pull/197), thanks [@chiruu12](https://github.com/chiruu12)).
+
+### Fixed
+
+- `restore` re-checks the restored memory's own `backed_by` sources. `backed_by`
+  propagation skips archived dependents, so a source superseded, archived or removed *while*
+  a dependent was archived left no `stale_backing` flag on it, and `restore` brought the
+  dependent back into recall citing withdrawn support with no flag, no lint finding and no
+  quality-queue entry. Restore now runs the same one-hop check against the sources' current
+  state and appends a `stale_backing` entry with `op: restore-check` (the `reason` names the
+  observed state: archived, superseded by X, or missing) for each source no longer active —
+  idempotent per source ref, in the restore's own commit, named in the history line, reported
+  as `stale_backing` in the result and on the CLI / MCP text output.
+- OpenClaw plugin: `plugin/openclaw.plugin.json` is now generated from the TypeBox config
+  schema in `plugin/index.ts` (`npm run manifest`; `plugin/test/manifest.test.ts` fails on
+  drift), so the manifest the host validates config against accepts the documented
+  `recallProfile`, `recallProfileConfig`, and `midTurnMode` keys it used to reject with
+  `invalid config`. Plugin version 0.2.0. The four Node test suites (`plugin/`,
+  `plugins/pi`, `plugins/core`, `plugins/cline`) moved out of `ci.yml` into
+  `.github/workflows/plugin-tests.yml`, a workflow that ships verbatim to the public repo,
+  where they previously did not run at all.
+- Hybrid search now returns chunks that have no vector — the FTS-only rows written by the
+  embed-rejection path (and by a deferred embed) — at the default threshold.
+  `search_hybrid` marks each BM25 candidate with `has_vector` and `rank_hybrid` exempts
+  vectorless candidates from the per-arm floor: the vector arm can never carry them and
+  normalized BM25 (`raw / 25.0`) rarely clears it, so the `EmbeddingInputError` recovery
+  text ("the chunk stays keyword-searchable") was not delivered. Chunks that have a vector
+  are floored exactly as before (the measured behavior is unchanged for them), and the exemption
+  retires on its own once a REEMBED pass backfills the vector.
+- Consolidation `MERGE` now writes every source fact it retires to the `-history.md`
+  sibling before mutating the file — the pre-merge text of `ids[0]` and each removed
+  `ids[1:]` line, verbatim, as `Merged into merged-<id> (date): <text> (reason: …)`
+  tagged with the source's own fact id. It was the one op of five that
+  dropped its working: SUPERSEDE, ARCHIVE and RETRACT already wrote history, so the
+  originals behind a merged conclusion survived only in `git log`, which recall
+  cannot address. The merged line itself is unchanged; a rejected or unmatched MERGE
+  still writes nothing. `docs/EXECUTOR-SPEC.md` records the contract.
+- `check_triggers` no longer raises `TypeError` on a trigger that has fired once and is
+  checked again without `cooldown_bypass`. The cooldown branch parsed
+  `last_fired` with `fromisoformat(value[:19])`, which stripped the `Z` suffix that
+  `update_trigger_fired` writes, then subtracted the resulting naive datetime from the
+  aware `_utc_now()` — so every trigger's second check crashed instead of applying its
+  cooldown. It now uses the same parse as `expires_at` (`palinode.core.expiry`): `Z` or
+  offset as written, a legacy naive string as UTC.
+- `bench/longmemeval_v2/adapter.py` — the `fts_mode: "and"` branch called the store without
+  the slice category filter, so on an extracted store the notes displaced the slices (10.8
+  notes + 2.8 slices per question instead of 6 + 10.9). Both stock-path calls now filter
+  like the OR arm; the first `and` measurement was discarded for this.
+- Ten CLI error paths now raise `click.Abort` instead of constructing and
+  discarding it, so failures exit non-zero; an AST guard prevents bare calls
+  from returning ([public #185](https://github.com/phasespace-labs/palinode/pull/185),
+  thanks [@costelEN](https://github.com/costelEN)).
+- `describe_match` now rounds match percentages half-up, matching the jq hook, its `cli/init.py`
+  copy and both TypeScript renderers. Python's `round()` was the only surface using banker's
+  rounding, so a cosine landing exactly on a half rendered one point lower there than everywhere else
+  ([#193](https://github.com/phasespace-labs/palinode/pull/193), thanks [@alorentiar](https://github.com/alorentiar)).
+- `POST /prompts/{name}/activate` now fails closed: if deactivating any sibling prompt fails, the
+  target is not activated and the endpoint returns 409 naming the file that blocked it, where it
+  previously activated the target anyway and returned 200 with two prompts left active. Rewrites
+  that already reached disk are still committed on the way out, and the sibling walk is sorted so
+  a part-way failure leaves the same state on every platform
+  ([#195](https://github.com/phasespace-labs/palinode/pull/195), thanks [@chiruu12](https://github.com/chiruu12)).
+- CLI text: the scaffolded Obsidian `_README.md` now shows the accepted re-run form
+  (`palinode init --obsidian --dir <vault-path>` — `init` takes no positional argument), and
+  `palinode reindex --help` reads as a sentence instead of "Explicitly trigger absolute
+  database rescans sequences."
+
+### Removed
+
+### Security
+
+## [0.16.0] — 2026-09-05
+
+### Added
+
+- `docs/PERFORMANCE.md` — published operating numbers on named boxes: search
+  latency p50/p95, index throughput, RAM and disk at 1k / 10k / 50k indexed chunks,
+  measured on an ordinary 4-vCPU / 4 GB Ubuntu container against a real GPU-resident
+  `bge-m3`. Keyword search stays under 10 ms across a 50× corpus increase and resident
+  memory is flat at 56–65 MiB, but the headline is that **vector-search latency is
+  dominated by the embedding round trip, not by the store**: 153 ms at 1k chunks and
+  149 ms at 10k, of which 125 ms is the query embedding itself. A second sweep with
+  embedding removed isolates sqlite-vec's brute-force scan at ~1.23 ms per 1,000 chunks,
+  reaching 200 ms at an extrapolated ~160k chunks — the real ceiling, and one most
+  self-hosters will not reach before their embedder becomes the constraint. Ingest is
+  embedder-bound at 7–8 chunks/s serial against a ~125 ms round trip; recall quality is
+  a different axis, measured in `docs/BENCHMARKS.md`.
+- `bench/perf.py` — the scale sweep behind that page, reusing the existing
+  `bench/corpus.py` generator and `bench/harness.py` pipeline. `--synthetic-vectors`
+  swaps the embedder for deterministic hash vectors so latency and throughput stay real
+  while the embedding bill goes to zero; the mode is stamped in the results JSON, never
+  reports a quality metric, and the rig aborts if a scale point indexes zero vectors so
+  vector-search latency can never be published for a store holding none.
+- `tier: abstract | overview | full` on `read` and `search`, across CLI (`--tier`), MCP,
+  REST and the plugin.
+  `abstract` returns the `summary:` frontmatter — falling back to `canonical_question:`,
+  then the first paragraph — capped at ~300 characters, so an agent can judge relevance
+  without pulling a record; `overview` returns the frontmatter block plus the head of the
+  body under a 4,000-character cap; `full` is unchanged content. Both caps are
+  configurable (`read.abstract_max_chars`, `read.overview_max_chars`). Views are computed
+  deterministically at read time — no LLM, and no second content store, so the markdown
+  file stays the single source of truth. Omitting `tier` preserves the previous response
+  shape on every surface.
+- Save receipts now report a closed `save_outcome` (`created`, `resaved`,
+  `disambiguated`, or `replaced`) plus the original slug when disambiguation
+  occurs. The raw API/JSON response, human CLI, and MCP confirmation all expose
+  the outcome so callers can distinguish new files from rewrites and explicit
+  replacements
+  ([#187](https://github.com/phasespace-labs/palinode/pull/187), thanks [@WilliamK112](https://github.com/WilliamK112)).
+- `docs/UI.md` documents the local provenance inspector, and the quickstart links it
+  ([#188](https://github.com/phasespace-labs/palinode/pull/188), thanks [@WilliamK112](https://github.com/WilliamK112)).
+- `docs/BENCHMARKS.md` row E: the production write path measured on a 100-question stratified
+  subset — session-end extraction alone beats raw-transcript reading (E0 0.810 vs 0.750);
+  consolidation's ARCHIVE op costs that gain back (E1 0.750) and filtering it via the
+  production `allowed_ops` config recovers and exceeds it (E1noarch 0.820); a fully local
+  pipeline (extraction + recall + reader on one RTX 5090) reaches 0.860 with a ledger-style
+  extraction prompt whose gain is reader-dependent (+12 local, −4 under Gemini). All at
+  ~2.7–3.8k reader tokens/answer vs ~22k raw.
+- `bench/longmemeval/pipeline.py` + `run.py --pipeline session-end|session-end+consolidate`
+  (`--keep-raw`): the production write path as a benchmark row — an extraction model produces
+  the session-end payload per haystack session, written through the real `session_end`
+  function into dated daily notes + a fact-tagged `projects/user.md` profile, then the real
+  `run_consolidation` applies the returned consolidation operations. Reports extraction
+  calls/tokens per question, a consolidation-ops histogram,
+  `answer_in_context`, and evidence recall traced through session-end's `Session ID` line.
+- `bench/longmemeval_v2/` — Palinode as a `memory_modules` backend for the
+  LongMemEval-V2 harness (web-agent trajectory memory): trajectory → markdown
+  state-slice pool, save-only LLM-free ingest through the canonical indexer,
+  hybrid recall with an OR-joined BM25 arm (`--palinode-fts-mode and` runs the
+  store's stock implicit-AND path for comparison), optional insert-time note
+  extraction (`specs/prompts/trajectory-extraction.md`), saved-store reuse across
+  runs, and a runner that supersets upstream `run_eval.py`. Stage 1 of the V2 program.
+
+### Changed
+
+- **PROGRAM.md now requires absolute dates and complete enumeration of options** in
+  extracted memories. Both are losses no later reader can repair: "last Tuesday"
+  cannot be resolved months on, and a decision recorded as "picked the second approach"
+  cannot recover the options that were dropped. Measured on the row-E benchmark as the
+  extraction losses no amount of retrieval quality could fix. The `/wrap` bodies that
+  `palinode init` installs carry the same two requirements. Deliberately *not* adopted:
+  the exhaustive event-ledger note shape, whose benefit proved reader-dependent.
+- **The LongMemEval extraction prompt default stays `v1`, now with the reasoning
+  recorded**. The ledger prompt `v2` is +12 points for a small local reader and
+  −4 for the Gemini-family reader the published rows use, at 40% more prompt tokens, so
+  it stays a documented per-reader choice via `LME_EXTRACT_PROMPT_VERSION` rather than
+  becoming the default. Selecting automatically per reader was rejected: it would make
+  two runs incomparable without reading their meta.
+- PROGRAM.md: "keep the source, not the takeaway" — extraction guidance and the ResearchRef template now ask for the basis a conclusion rests on, since a bare conclusion cannot be corrected later (Kwon, arXiv:2606.25449).
+- PROGRAM.md: state the trajectory principle — correctness is a property of the memory's state trajectory, not of individual records — so transitions preserve supersession, evidence relationships, and useful signal (Orogat & Mansour, arXiv:2605.26252).
+- File reconciliation now sends every section awaiting an embedding in one ordered
+  Ollama `/api/embed` batch, validates the complete response before writing, and
+  preserves per-input FTS-only degradation and whole-file outage rollback
+  ([#186](https://github.com/phasespace-labs/palinode/pull/186), thanks [@WilliamK112](https://github.com/WilliamK112)).
+- `docs/BENCHMARKS.md` gains *LongMemEval-V2 (small tier)*: 13 rows under identical
+  reader, judge and 40k context budget — upstream's own slice-RAG baseline rerun,
+  Palinode's LLM-free store, and the write path (extracted notes + slices). The
+  LLM-free store matches the purpose-built baseline; the write path adds +6 overall
+  and +12 on web, and is level on enterprise. Per-type tables, the losses, the noise
+  floor, and the per-question artifacts under `bench/results/longmemeval-v2-*/`.
+  No leaderboard submission (stage-1 gate not met).
+
+### Fixed
+
+- A failed auto-trigger registration during the layer-split sweep is now logged as a warning instead of printed to the API server's stdout, so it carries a level, reaches the JSONL operations log, and passes through `SecretRedactingFilter` like every other diagnostic in the package ([#176](https://github.com/phasespace-labs/palinode/pull/176), thanks [@chiruu12](https://github.com/chiruu12)).
+- `GET /prompts` now logs a warning naming any prompt file it cannot read, while continuing to
+  return the prompts it could, so a partial listing is diagnosable instead of silent
+  ([#181](https://github.com/phasespace-labs/palinode/pull/181), thanks [@kudala-bharani](https://github.com/kudala-bharani)).
+- `lint`'s two staleness checks no longer wrap the whole date-parse-and-compare block in
+  `except Exception: pass`. Only the `datetime.fromisoformat` call is guarded, against
+  `ValueError`; a non-date frontmatter value is handled explicitly; and any other error in the
+  block propagates instead of silently dropping the file from the staleness report
+  ([#182](https://github.com/phasespace-labs/palinode/pull/182), thanks [@Rehan30g](https://github.com/Rehan30g)).
+- `git_tools.history()` now reports diff stats and, under `detail="full"`, diffs for commits
+  older than a rename, and for the repository's root commit. Both were computed by a
+  per-commit `git diff --stat` / `git show`. For commits older than a rename those passed the
+  file's current path without `--follow`, so git was asked about a path that did not exist yet
+  and returned a misleading figure or nothing; the root commit was blank for a separate
+  reason, that `{sha}^..{sha}` has no parent to resolve. A single
+  `git log --follow --shortstat` walk now produces both, dropping the subprocess count for a
+  20-commit history from 21 (41 under `detail="full"`) to 1. The `diff` string under
+  `detail="full"` now starts at `diff --git` rather than at the `git show` commit header
+  ([#183](https://github.com/phasespace-labs/palinode/pull/183), thanks [@chiruu12](https://github.com/chiruu12)).
+- The Pi/Cline shared plugin core and the OpenClaw plugin no longer present a fused rank as
+  similarity: vector hits show raw cosine as a match percentage, BM25-only hits show
+  `keyword match, rank N.NN`, and legacy responses without `raw_score` show `rank N.NN`.
+  This completes the five renderer surfaces across six files
+  ([#178](https://github.com/phasespace-labs/palinode/pull/178), thanks [@WilliamK112](https://github.com/WilliamK112)).
+
+### Removed
+
+### Security
+
+## [0.15.0] — 2026-09-01
+
+**Compatibility:** every memory written by this release carries a new
+`auditable_memory: "0.1"` frontmatter field — the Auditable Memory Records
+conformance declaration. Readers that ignore unknown frontmatter are unaffected,
+and files written by earlier releases are not rewritten. Separately, `confidence`
+outside `[0.0, 1.0]` is now rejected with a validation error on every surface,
+including a value supplied through `metadata`, where earlier releases wrote it
+verbatim; a caller that relied on an out-of-range value landing in frontmatter
+must send a value in range.
+
+### Added
+
+- Every memory the save path writes now carries `auditable_memory: "0.1"` — the
+  [Auditable Memory Records 0.1](https://github.com/phasespace-labs/auditable-memory-records)
+  conformance declaration the specification requires (§4.1), on all four surfaces
+  (MCP, REST, CLI, plugins) since they share one writer. A caller-supplied value the
+  implementation does not recognise is rejected rather than guessed at. `confidence`
+  is now validated to `[0.0, 1.0]` whether it arrives as a parameter or through
+  `metadata` (an out-of-range value was previously written verbatim). The
+  specification's conformance suite is vendored under `tests/amr_conformance/` and
+  runs in CI against the implementation: normalization, Level 1 (Marked), Level 2
+  (Linked), and Level 3 (Cited) all pass — the honest claim is Level 3, with the
+  spec's own caveat that the suite demonstrates conformance on its vectors, not
+  across a private corpus.
+- `docs/BENCHMARKS.md`: LongMemEval_S results with methodology and losses — evidence recall@10
+  0.981 from LLM-free save + hybrid recall; accuracy 0.482 / 0.812 / 0.882 / 0.758 with a local
+  30B, Gemini 3 Flash, GPT-5.5, and GPT-4o reader under upstream's gpt-4o judge; comparison
+  against published Zep / Supermemory rows; judge-agreement, reader-prompt sensitivity, and cost
+  figures.
+- `bench/longmemeval/`: LongMemEval (Wu et al., ICLR 2025) adapter — one fresh store per
+  question, haystack sessions as dated daily notes through the canonical indexer, hybrid or
+  keyword recall, pluggable OpenAI-compatible answerer and judge on separate endpoints, upstream
+  judge prompts verbatim, evidence-recall@k, upstream-compatible `hypotheses.jsonl`.
 - Standalone `bench.abstention` evaluation for search abstention: a real
   SQLite-vec + FTS5 threshold sweep across multiple seeded corpora, with
   no-answer false-positive rates, answer-present controls, and both fused and
@@ -14,8 +1453,52 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Changed
 
+- README and `docs/HOW-MEMORY-WORKS.md` now describe hybrid retrieval accurately: the vector
+  arm carries full-sentence questions (FTS5's implicit AND requires every query token to
+  co-occur), BM25 carries exact terms and identifiers, and the combined system's measured
+  0.981 evidence recall@10 backs the retrieval claim. Re-weighting the BM25 arm is deferred as
+  unwarranted at that recall.
+- README and ROADMAP now point at `docs/BENCHMARKS.md`; the ROADMAP's "external benchmark
+  evidence" item is updated from "current priority" to first results plus what's next.
+
 ### Fixed
 
+- The Claude Code recall hook and the copy `palinode init` embeds no longer present a fused rank as a similarity: a BM25-only hit now reports `keyword match, rank N.NN` and a pre-0.12 response reports `rank N.NN`, matching `describe_match`. A cross-language test pins the hook's output to the Python implementation ([#174](https://github.com/phasespace-labs/palinode/pull/174), thanks [@chiruu12](https://github.com/chiruu12)).
+- A per-input embedding failure (Ollama bge-m3 returning HTTP 500 `unsupported value: NaN` for
+  specific strings) is no longer treated as a backend outage. It is now a typed
+  `EmbeddingInputError`: no retries, no circuit-breaker hit, no keyword-only-mode notice.
+  Indexing writes just the affected section FTS-only and commits the rest of the file —
+  previously the whole file was aborted and the note silently vanished from recall entirely,
+  not even keyword-searchable. `/search` degrades such a query to the BM25 arm with hits marked
+  `mode: keyword-fallback` instead of failing, and embed-dependent endpoints without a fallback
+  return a typed 422 instead of a misleading 503.
+- FTS5 syntax characters (`?`, `:`, `(`, `)`, `*`, `^`, `.`, …) in a search query no longer
+  raise from the keyword arm: `sanitize_fts_query` now strips all non-word punctuation, so a
+  question-shaped query like `What breed is the user's dog?` keeps its BM25 arm instead of
+  erroring — previously hybrid search misread the error as index corruption, ran a full FTS
+  rebuild per query, and silently returned vector-only results. Dropping the BM25 arm now logs a
+  warning, and the empty-query fallback is a valid empty phrase instead of the erroring `*`.
+- MCP and CLI search output now presents raw cosine similarity as the match
+  percentage and labels keyword-only or legacy fused values as rank instead of
+  presenting RRF rank as confidence
+  ([#171](https://github.com/phasespace-labs/palinode/pull/171), thanks
+  [@chiruu12](https://github.com/chiruu12)).
+- `palinode stop` now exits non-zero when `systemctl` is unavailable or any
+  selected service fails to stop, while still attempting the remaining services.
+- Corrected three public docs that pointed at things which do not exist. `ROADMAP.md` announced
+  "Current version: 0.10.x" four minor releases after the fact; `docs/OBSIDIAN.md` offered
+  `palinode log` and `docs/LAUNCH-CHECKLIST.md` offered `palinode deploy-systemd`, neither of
+  which is a registered command — they are `palinode history <file>` and
+  `deploy/systemd/install.sh`.
+- The MCP HTTP bind-gate refusal now names the knob that actually set the bind. It previously
+  always blamed `PALINODE_MCP_HTTP_HOST`, so an operator who bound with `--host 0.0.0.0` was told
+  to change an environment variable they had never set; the refusal and the token-less startup
+  warning now say `--host 127.0.0.1`, `export PALINODE_MCP_HTTP_HOST=...`, or the deprecated
+  `PALINODE_MCP_SSE_HOST` alias, matching the documented flag > env > default precedence.
+- Executor test fixtures and assertions now read and write Palinode-generated files explicitly as
+  UTF-8, with a ratcheting guard that prevents swept test areas from reintroducing locale-default
+  text I/O ([#149](https://github.com/phasespace-labs/palinode/pull/149),
+  thanks [@chiruu12](https://github.com/chiruu12)).
 - Memory-file moves no longer fail on native Windows when directory fsync is
   unavailable; they now use the same guarded durability fallback as atomic
   writes.
@@ -24,6 +1507,10 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
   yellow "reindex already running" (HTTP 409) path, which is informational.
 - MCP Registry release metadata now stays aligned with the package version and
   links to the current release notes.
+- Archive-history test fixtures and assertions now read and write Palinode-generated files
+  explicitly as UTF-8, including the `_git` helper's `subprocess.run`, with all three files joining
+  the ratcheting guard ([#167](https://github.com/phasespace-labs/palinode/pull/167), thanks
+  [@chiruu12](https://github.com/chiruu12)).
 
 ### Removed
 

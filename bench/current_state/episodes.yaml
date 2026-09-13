@@ -1,0 +1,1422 @@
+# Current-state acceptance corpus — authored (dev) split.
+#
+# Every scenario family in the design carries a positive control (the
+# transition happened) and a negative control (structurally the same, nothing
+# changed). The held-out split is DERIVED from this file at load time by
+# project substitution and question paraphrase under a fixed seed — do not
+# author held-out episodes here, and do not use a held-out project name.
+#
+# Oracles state the REQUIRED result, not the observed one. Where the shipped
+# policy deliberately declines to produce the required result, the question
+# carries a `note:` and the report keeps the failure.
+corpus_version: 1
+
+episodes:
+
+  # ── 1. Explicit A → B replacement ────────────────────────────────────────
+  - id: explicit-replacement-pos
+    family: explicit_replacement
+    control: positive
+    project: atlas
+    tags: [mechanical, release_fixture]
+    before:
+      at: 1
+      ask: which cache backend does atlas use
+      answer: Memcached
+    events:
+      - op: save
+        ref: projects/atlas-status
+        title: Atlas cache status
+        type: ProjectSnapshot
+        date: "2026-01-10"
+        fm: {entities: [project/atlas], status: active}
+        body: |
+          - [2026-01-10] The atlas cache backend is Memcached. <!-- fact:atlas-cache -->
+          - [2026-01-10] The atlas cache eviction policy is allkeys-lru. <!-- fact:atlas-evict -->
+      - op: save
+        ref: daily/2026-02-14-atlas-cache
+        title: Atlas cache session
+        type: Insight
+        date: "2026-02-14"
+        fm: {entities: [project/atlas]}
+        body: Session notes for atlas. The cache backend was moved to Redis this week.
+      - op: consolidate
+        pass: nightly
+        ops:
+          - op: SUPERSEDE
+            id: atlas-cache
+            new_text: "[2026-02-14] The atlas cache backend is Redis."
+            rationale: replaced in the February session
+    questions:
+      - ask: which cache backend does atlas use
+        disposition: current
+        answer: Redis
+        not_current: [Memcached]
+        evidence: [projects/atlas-status]
+
+  - id: explicit-replacement-neg
+    family: explicit_replacement
+    control: negative
+    project: atlas
+    before:
+      at: 1
+      ask: which queue backend does atlas use
+      answer: RabbitMQ
+    events:
+      - op: save
+        ref: decisions/atlas-queue
+        title: Atlas queue backend
+        type: Decision
+        date: "2026-01-12"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas queue backend is RabbitMQ for every environment.
+      - op: save
+        ref: insights/atlas-queue-review
+        title: Atlas queue review
+        type: Insight
+        date: "2026-03-04"
+        fm: {entities: [project/atlas]}
+        body: The atlas queue backend was reviewed this quarter and left unchanged.
+    questions:
+      - ask: which queue backend does atlas use
+        disposition: current
+        answer: RabbitMQ
+        not_current: [Kafka]
+        evidence: [decisions/atlas-queue]
+
+  # ── 2. New proposal after an accepted decision ───────────────────────────
+  - id: proposal-after-decision-pos
+    family: proposal_after_decision
+    control: positive
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-auth
+        title: Beacon authentication
+        type: Decision
+        date: "2026-01-15"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon service authenticates with OAuth2 client credentials.
+      - op: save
+        ref: insights/beacon-auth-proposal
+        title: Beacon authentication proposal
+        type: Insight
+        date: "2026-03-02"
+        fm:
+          entities: [project/beacon]
+          epistemic: open_question
+          contradicts: [decisions/beacon-auth]
+        body: Proposal for the beacon service authenticates path — move to mTLS instead.
+    questions:
+      - ask: how does the beacon service authenticate
+        disposition: current
+        answer: OAuth2
+        not_current: [mTLS]
+        evidence: [decisions/beacon-auth]
+
+  - id: proposal-after-decision-neg
+    family: proposal_after_decision
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-logging
+        title: Beacon log shipping
+        type: Decision
+        date: "2026-01-18"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon service ships logs to the central collector over gRPC.
+      - op: save
+        ref: insights/beacon-logging-measured
+        title: Beacon log shipping measured
+        type: Insight
+        date: "2026-02-20"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: Measured beacon service ships logs over gRPC at steady state without loss.
+    questions:
+      - ask: how does the beacon service ship logs
+        disposition: current
+        answer: gRPC
+        not_current: [syslog]
+        evidence: [decisions/beacon-logging]
+
+  # ── 3. Delayed import of an old record ───────────────────────────────────
+  - id: delayed-import-pos
+    family: delayed_import
+    control: positive
+    project: cinder
+    before:
+      at: 1
+      ask: which deployment region does cinder use
+      answer: eu-west-1
+    events:
+      - op: save
+        ref: decisions/cinder-region-v2
+        title: Cinder deployment region
+        type: Decision
+        date: "2026-04-01"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder deployment region is eu-west-1.
+      - op: save
+        ref: decisions/cinder-region-v1
+        title: Cinder deployment region, imported late
+        type: Decision
+        date: "2026-01-05"
+        fm:
+          entities: [project/cinder]
+          status: active
+          contradicts: [decisions/cinder-region-v2]
+        body: The cinder deployment region is us-east-1.
+    questions:
+      - ask: which deployment region does cinder use
+        disposition: contested
+        sides: [eu-west-1, us-east-1]
+        evidence: [decisions/cinder-region-v1, decisions/cinder-region-v2]
+
+  - id: delayed-import-neg
+    family: delayed_import
+    control: negative
+    project: cinder
+    events:
+      - op: save
+        ref: decisions/cinder-tls-termination
+        title: Cinder TLS termination
+        type: Decision
+        date: "2026-04-02"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder ingress terminates TLS at the edge proxy.
+      - op: save
+        ref: insights/cinder-january-loadtest
+        title: Cinder January load test
+        type: Insight
+        date: "2026-01-02"
+        fm: {entities: [project/cinder]}
+        body: An old cinder note imported late — a load test ran in January against the ingress.
+    questions:
+      - ask: where does cinder ingress terminate TLS
+        disposition: current
+        answer: edge proxy
+        not_current: [origin server]
+        evidence: [decisions/cinder-tls-termination]
+
+  # ── 4. Future-effective replacement and the acting-state boundary ────────
+  - id: future-effective-expiry-pos
+    family: future_effective
+    control: positive
+    project: atlas
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: who is the acting atlas release manager
+      answer: Priya
+    events:
+      - op: save
+        ref: projects/atlas-acting-release-manager
+        title: Atlas acting release manager
+        type: ProjectSnapshot
+        date: "2026-02-01"
+        fm: {entities: [project/atlas], status: active, expires_at: "2026-03-01"}
+        body: The acting atlas release manager is Priya while the permanent owner is on leave.
+      - op: advance_clock
+        to: "2026-03-15"
+    questions:
+      - ask: who is the acting atlas release manager
+        disposition: unknown
+        not_current: [Priya]
+        evidence: [projects/atlas-acting-release-manager]
+
+  - id: future-effective-notyet-pos
+    family: future_effective
+    control: positive
+    project: atlas
+    before:
+      at: 1
+      ask: what is the atlas API rate limit
+      answer: 100 requests per minute
+    events:
+      - op: save
+        ref: decisions/atlas-ratelimit-v1
+        title: Atlas API rate limit
+        type: Decision
+        date: "2026-01-20"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas API rate limit is 100 requests per minute.
+      - op: save
+        ref: decisions/atlas-ratelimit-v2
+        title: Atlas API rate limit from June
+        type: Decision
+        date: "2026-06-01"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas API rate limit is 500 requests per minute.
+      - op: supersede_record
+        ref: decisions/atlas-ratelimit-v1
+        by: decisions/atlas-ratelimit-v2
+        reason: raised from June
+      - op: advance_clock
+        to: "2026-03-01"
+    questions:
+      - ask: what is the atlas API rate limit
+        disposition: current
+        answer: 100 requests per minute
+        not_current: [500 requests per minute]
+        evidence: [decisions/atlas-ratelimit-v2]
+        note: >-
+          The design's required result is that the old value remains applicable
+          until the transition. The shipped policy retires the predecessor the
+          moment the replacement is written and then declines, because the
+          successor is not yet effective. Kept as an oracle so the gap is a
+          number rather than a footnote.
+
+  - id: future-effective-neg
+    family: future_effective
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: projects/beacon-acting-release-manager
+        title: Beacon acting release manager
+        type: ProjectSnapshot
+        date: "2026-05-01"
+        fm: {entities: [project/beacon], status: active, expires_at: "2026-12-01"}
+        body: The acting beacon release manager is Dana until the end of the year.
+      - op: advance_clock
+        to: "2026-06-01"
+    questions:
+      - ask: who is the acting beacon release manager
+        disposition: current
+        answer: Dana
+        not_current: [Priya]
+        evidence: [projects/beacon-acting-release-manager]
+        qualifiers: ["expires_at:"]
+
+  # ── 5. Staging differs from production ───────────────────────────────────
+  - id: staging-vs-production-pos
+    family: staging_vs_production
+    control: positive
+    project: atlas
+    events:
+      - op: save
+        ref: insights/atlas-object-store-staging
+        title: Atlas object store in staging
+        type: Insight
+        date: "2026-02-05"
+        fm: {entities: [project/atlas, env/staging], epistemic: fact}
+        body: In the staging environment the atlas object store is MinIO.
+      - op: save
+        ref: insights/atlas-object-store-production
+        title: Atlas object store in production
+        type: Insight
+        date: "2026-02-06"
+        fm:
+          entities: [project/atlas, env/production]
+          epistemic: fact
+          contradicts: [insights/atlas-object-store-staging]
+        body: In the production environment the atlas object store is S3.
+    questions:
+      - ask: in the production environment what is the atlas object store
+        disposition: current
+        answer: S3
+        evidence: [insights/atlas-object-store-production]
+        qualifiers: [scope_disjoint]
+
+  - id: staging-vs-production-neg
+    family: staging_vs_production
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-cache-tier-production
+        title: Beacon cache tier in production
+        type: Insight
+        date: "2026-02-05"
+        fm: {entities: [project/beacon, env/production], epistemic: fact}
+        body: In the production environment the beacon cache tier is Redis.
+      - op: save
+        ref: insights/beacon-cache-tier-review
+        title: Beacon cache tier review
+        type: Insight
+        date: "2026-03-05"
+        fm: {entities: [project/beacon, env/production]}
+        body: The beacon cache tier in the production environment was reviewed and left as is.
+    questions:
+      - ask: in the production environment what is the beacon cache tier
+        disposition: current
+        answer: Redis
+        not_current: [Memcached]
+        evidence: [insights/beacon-cache-tier-production]
+
+  # ── 6. Policy differs from deployment ────────────────────────────────────
+  - id: policy-vs-deployment-pos
+    family: policy_vs_deployment
+    control: positive
+    project: cinder
+    tags: [release_fixture]
+    events:
+      - op: save
+        ref: decisions/cinder-tls-policy
+        title: Cinder TLS policy
+        type: Decision
+        date: "2026-02-01"
+        fm: {entities: [project/cinder], status: active}
+        body: Policy — the cinder fleet must serve TLS 1.3 only.
+      - op: save
+        ref: projects/cinder-tls-observed
+        title: Cinder TLS observed
+        type: ProjectSnapshot
+        date: "2026-04-10"
+        fm:
+          entities: [project/cinder]
+          epistemic: fact
+          contradicts: [decisions/cinder-tls-policy]
+        body: Observed — the cinder fleet still serves TLS 1.2 in two regions.
+    questions:
+      - ask: which TLS version does the cinder fleet serve
+        disposition: contested
+        sides: [TLS 1.3, TLS 1.2]
+        evidence: [decisions/cinder-tls-policy, projects/cinder-tls-observed]
+        qualifiers: [policy_implementation_mismatch]
+
+  - id: policy-vs-deployment-neg
+    family: policy_vs_deployment
+    control: negative
+    project: cinder
+    events:
+      - op: save
+        ref: decisions/cinder-mfa-policy
+        title: Cinder admin access policy
+        type: Decision
+        date: "2026-02-02"
+        fm: {entities: [project/cinder], status: active}
+        body: Policy — cinder admin access requires hardware MFA.
+      - op: save
+        ref: projects/cinder-mfa-observed
+        title: Cinder admin access observed
+        type: ProjectSnapshot
+        date: "2026-04-11"
+        fm: {entities: [project/cinder], epistemic: fact}
+        body: Observed — every cinder admin account uses hardware MFA.
+    questions:
+      - ask: what does cinder admin access require
+        disposition: current
+        answer: hardware MFA
+        not_current: [SMS codes]
+        evidence: [decisions/cinder-mfa-policy]
+
+  # ── 7. One claim changes in a multi-claim file ───────────────────────────
+  - id: multi-claim-file-pos
+    family: multi_claim_file
+    control: positive
+    project: atlas
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: which Python version does the atlas build run on
+      answer: Python 3.11
+    events:
+      - op: save
+        ref: projects/atlas-build-status
+        title: Atlas build status
+        type: ProjectSnapshot
+        date: "2026-01-06"
+        fm: {entities: [project/atlas], status: active}
+        body: |
+          - [2026-01-06] The atlas build runs on Python 3.11. <!-- fact:atlas-py -->
+          - [2026-01-06] The atlas image registry is ghcr. <!-- fact:atlas-registry -->
+          - [2026-01-06] The atlas health check path is /healthz. <!-- fact:atlas-health -->
+      - op: supersede_fact
+        ref: projects/atlas-build-status
+        fact: atlas-py
+        new_text: "[2026-03-05] The atlas build runs on Python 3.12."
+        reason: upgraded in March
+    questions:
+      - ask: which Python version does the atlas build run on
+        disposition: current
+        answer: Python 3.12
+        not_current: [Python 3.11]
+        evidence: [projects/atlas-build-status]
+      - ask: what is the atlas health check path
+        disposition: current
+        answer: /healthz
+        evidence: [projects/atlas-build-status]
+
+  - id: multi-claim-file-neg
+    family: multi_claim_file
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: projects/beacon-build-status
+        title: Beacon build status
+        type: ProjectSnapshot
+        date: "2026-01-06"
+        fm: {entities: [project/beacon], status: active}
+        body: |
+          - [2026-01-06] The beacon build runs on Python 3.11. <!-- fact:beacon-py -->
+          - [2026-01-06] The beacon image registry is ghcr. <!-- fact:beacon-registry -->
+          - [2026-01-06] The beacon health check path is /healthz. <!-- fact:beacon-health -->
+    questions:
+      - ask: which Python version does the beacon build run on
+        disposition: current
+        answer: Python 3.11
+        not_current: [Python 3.12]
+        evidence: [projects/beacon-build-status]
+      - ask: what is the beacon health check path
+        disposition: current
+        answer: /healthz
+        evidence: [projects/beacon-build-status]
+
+  # ── 8. Source retracted without a replacement ────────────────────────────
+  - id: retraction-without-replacement-pos
+    family: retraction_without_replacement
+    control: positive
+    project: cinder
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: what was the measured cinder p99 latency
+      answer: 120 ms
+    events:
+      - op: save
+        ref: insights/cinder-latency-benchmark
+        title: Cinder latency benchmark
+        type: Insight
+        date: "2026-01-12"
+        fm: {entities: [project/cinder], epistemic: fact}
+        body: Benchmark — the measured cinder p99 latency is 120 ms.
+      - op: save
+        ref: insights/cinder-latency-claim
+        title: Cinder latency target
+        type: Insight
+        date: "2026-01-20"
+        fm:
+          entities: [project/cinder]
+          backed_by: [insights/cinder-latency-benchmark]
+        body: The cinder service clears its latency target with room at 150 ms.
+      - op: archive_record
+        ref: insights/cinder-latency-benchmark
+        reason: the measurement was withdrawn
+    questions:
+      - ask: does the cinder service clear its latency target
+        disposition: unknown
+        not_current: [150 ms]
+        evidence: [insights/cinder-latency-claim]
+
+  - id: retraction-without-replacement-neg
+    family: retraction_without_replacement
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-throughput-benchmark
+        title: Beacon throughput benchmark
+        type: Insight
+        date: "2026-01-12"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: Benchmark — the measured beacon sustained throughput is 4200 rps.
+      - op: save
+        ref: insights/beacon-throughput-claim
+        title: Beacon capacity bar
+        type: Insight
+        date: "2026-01-20"
+        fm:
+          entities: [project/beacon]
+          backed_by: [insights/beacon-throughput-benchmark]
+        body: The beacon service clears its capacity bar of 4000 rps.
+    questions:
+      - ask: does the beacon service clear its capacity bar
+        disposition: current
+        answer: 4000 rps
+        evidence: [insights/beacon-throughput-claim]
+
+  # ── 9. Source changes with an explicit derivation rule ───────────────────
+  - id: declared-derivation-pos
+    family: declared_derivation
+    control: positive
+    project: atlas
+    before:
+      at: 2
+      ask: what is the atlas monthly storage cost at 10 TB
+      answer: 230 dollars
+    events:
+      - op: save
+        ref: insights/atlas-storage-unit-price
+        title: Atlas storage unit price
+        type: Insight
+        date: "2026-01-08"
+        fm: {entities: [project/atlas], epistemic: fact}
+        body: The atlas storage unit price is 0.023 per GB-month.
+      - op: save
+        ref: insights/atlas-storage-cost-model
+        title: Atlas storage cost model
+        type: Insight
+        date: "2026-01-09"
+        fm:
+          entities: [project/atlas]
+          backed_by: [insights/atlas-storage-unit-price]
+        body: Derived from the unit price — the atlas monthly storage cost is 230 dollars at 10 TB.
+      - op: save
+        ref: insights/atlas-storage-unit-price-v2
+        title: Atlas storage unit price, renegotiated
+        type: Insight
+        date: "2026-05-04"
+        fm: {entities: [project/atlas], epistemic: fact}
+        body: The atlas storage unit price is 0.018 per GB-month.
+      - op: supersede_record
+        ref: insights/atlas-storage-unit-price
+        by: insights/atlas-storage-unit-price-v2
+        reason: renegotiated contract
+    questions:
+      - ask: what is the atlas monthly storage cost at 10 TB
+        disposition: unknown
+        not_current: [230 dollars]
+        evidence: [insights/atlas-storage-cost-model]
+      - ask: what is the atlas storage unit price per GB-month
+        disposition: current
+        answer: "0.018"
+        not_current: ["0.023"]
+        evidence: [insights/atlas-storage-unit-price-v2]
+
+  - id: declared-derivation-neg
+    family: declared_derivation
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-egress-unit-price
+        title: Beacon egress unit price
+        type: Insight
+        date: "2026-01-08"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: The beacon egress unit price is 0.09 per GB.
+      - op: save
+        ref: insights/beacon-egress-cost-model
+        title: Beacon egress cost model
+        type: Insight
+        date: "2026-01-09"
+        fm:
+          entities: [project/beacon]
+          backed_by: [insights/beacon-egress-unit-price]
+        body: Derived from the unit price — the beacon monthly egress cost is 90 dollars at 1 TB.
+    questions:
+      - ask: what is the beacon monthly egress cost at 1 TB
+        disposition: current
+        answer: 90 dollars
+        evidence: [insights/beacon-egress-cost-model]
+
+  # ── 10. Multi-source and copied-observation lineage ──────────────────────
+  - id: multi-source-two-hop-pos
+    family: multi_source_two_hop
+    control: positive
+    project: cinder
+    tags: [lineage]
+    events:
+      - op: save
+        ref: insights/cinder-scheduler-restart-observation
+        title: Cinder scheduler restart observation
+        type: Insight
+        date: "2026-04-10"
+        fm: {entities: [project/cinder], epistemic: fact}
+        body: Observed — the cinder scheduler restarted 3 times during the April rollout.
+      - op: save
+        ref: insights/cinder-april-session-summary
+        title: Cinder April session summary
+        type: Insight
+        date: "2026-04-11"
+        fm:
+          entities: [project/cinder]
+          backed_by: [insights/cinder-scheduler-restart-observation]
+        body: Session summary — the cinder scheduler restarted 3 times during the April rollout.
+      - op: save
+        ref: projects/cinder-april-snapshot
+        title: Cinder April snapshot
+        type: ProjectSnapshot
+        date: "2026-04-12"
+        fm:
+          entities: [project/cinder]
+          backed_by: [insights/cinder-scheduler-restart-observation]
+        body: Snapshot — the cinder scheduler restarted 3 times in the April rollout window.
+    questions:
+      - ask: how many times did the cinder scheduler restart during the April rollout
+        disposition: current
+        answer: 3 times
+        evidence: [insights/cinder-scheduler-restart-observation]
+
+  - id: multi-source-two-hop-neg
+    family: multi_source_two_hop
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-queue-depth-metric
+        title: Beacon queue depth metric
+        type: Insight
+        date: "2026-03-01"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: Observed — the beacon queue depth peaked at 1200 messages.
+      - op: save
+        ref: insights/beacon-queue-depth-check
+        title: Beacon queue depth independent check
+        type: Insight
+        date: "2026-03-02"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: Independent check — the beacon queue depth peaked at 1200 messages.
+    questions:
+      - ask: what was the peak beacon queue depth
+        disposition: current
+        answer: 1200 messages
+        evidence: [insights/beacon-queue-depth-metric]
+
+  # ── 11. Correction lacking the original vocabulary ───────────────────────
+  - id: unlinked-correction-pos
+    family: unlinked_correction
+    control: positive
+    project: atlas
+    events:
+      - op: save
+        ref: decisions/atlas-retry-policy
+        title: Atlas client retry policy
+        type: Decision
+        date: "2026-01-14"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas client retry policy is three attempts with fixed backoff.
+      - op: save
+        ref: insights/atlas-retry-note-one
+        title: Atlas retry note one
+        type: Insight
+        date: "2026-01-21"
+        fm: {entities: [project/atlas]}
+        body: A note on the atlas client retry policy — the three attempts are counted per host.
+      - op: save
+        ref: insights/atlas-retry-note-two
+        title: Atlas retry note two
+        type: Insight
+        date: "2026-01-22"
+        fm: {entities: [project/atlas]}
+        body: Another note on the atlas client retry policy — retry attempts are logged at debug level.
+      - op: save
+        ref: insights/atlas-retry-note-three
+        title: Atlas retry note three
+        type: Insight
+        date: "2026-01-23"
+        fm: {entities: [project/atlas]}
+        body: A third note on the atlas client retry policy — the policy applies to idempotent calls only.
+      - op: save
+        ref: insights/atlas-scheduling-change
+        title: Atlas request scheduling change
+        type: Insight
+        date: "2026-05-02"
+        fm: {entities: [project/atlas]}
+        body: Correction — exponential jitter replaced the fixed schedule for outbound calls.
+    questions:
+      - ask: what is the atlas client retry policy
+        disposition: contested
+        sides: [fixed backoff, exponential jitter]
+        evidence: [insights/atlas-scheduling-change]
+        note: >-
+          The correction carries no typed link and shares no vocabulary with the
+          decision, so the policy has nothing mechanical to contest the seed
+          with. The measurable stage here is detection — whether the correction
+          reaches the reader at all, in the payload and in the rendered text.
+
+  - id: unlinked-correction-neg
+    family: unlinked_correction
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-retry-policy
+        title: Beacon client retry policy
+        type: Decision
+        date: "2026-01-14"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon client retry policy is three attempts with fixed backoff.
+      - op: save
+        ref: insights/beacon-retry-note-one
+        title: Beacon retry note one
+        type: Insight
+        date: "2026-01-21"
+        fm: {entities: [project/beacon]}
+        body: A note on the beacon client retry policy — the three attempts are counted per host.
+      - op: save
+        ref: insights/beacon-retry-note-two
+        title: Beacon retry note two
+        type: Insight
+        date: "2026-01-22"
+        fm: {entities: [project/beacon]}
+        body: Another note on the beacon client retry policy — retry attempts are logged at debug level.
+      - op: save
+        ref: insights/beacon-retry-note-three
+        title: Beacon retry note three
+        type: Insight
+        date: "2026-01-23"
+        fm: {entities: [project/beacon]}
+        body: A third note on the beacon client retry policy — the policy applies to idempotent calls only.
+    questions:
+      - ask: what is the beacon client retry policy
+        disposition: current
+        answer: fixed backoff
+        not_current: [exponential jitter]
+        evidence: [decisions/beacon-retry-policy]
+
+  # ── 12. Archived memory that stays in place ──────────────────────────────
+  - id: archived-in-place-pos
+    family: archived_in_place
+    control: positive
+    project: atlas
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: what is the atlas on-call rota
+      answer: weekly with a Friday handover
+    events:
+      - op: save
+        ref: insights/atlas-oncall-rota
+        title: Atlas on-call rota
+        type: Insight
+        date: "2026-01-30"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas on-call rota is weekly with a Friday handover.
+      - op: move_to_archive
+        ref: insights/atlas-oncall-rota
+    questions:
+      - ask: what is the atlas on-call rota
+        disposition: unknown
+        not_current: [weekly with a Friday handover]
+        evidence: [archive/insights/atlas-oncall-rota]
+
+  - id: archived-in-place-neg
+    family: archived_in_place
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-oncall-rota
+        title: Beacon on-call rota
+        type: Insight
+        date: "2026-01-30"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon on-call rota is weekly with a Friday handover.
+      - op: save
+        ref: insights/beacon-oncall-confirmation
+        title: Beacon on-call confirmation
+        type: Insight
+        date: "2026-02-28"
+        fm: {entities: [project/beacon]}
+        body: The beacon on-call rota was reviewed this month and confirmed.
+    questions:
+      - ask: what is the beacon on-call rota
+        disposition: current
+        answer: weekly with a Friday handover
+        evidence: [insights/beacon-oncall-rota]
+
+  # ── 13. Retired wording beside active text ───────────────────────────────
+  - id: retired-beside-active-pos
+    family: retired_beside_active
+    control: positive
+    project: cinder
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: which keybindings does the cinder team use in the shared editor
+      answer: vim keybindings
+    events:
+      - op: save
+        ref: insights/cinder-editor-conventions
+        title: Cinder editor conventions
+        type: Insight
+        date: "2026-01-25"
+        fm: {entities: [project/cinder], status: active}
+        body: >-
+          Cinder tooling conventions. The team uses vim keybindings in the shared editor.
+          The shared editor theme is solarized dark. Tabs are four spaces wide.
+      - op: retract_mention
+        ref: insights/cinder-editor-conventions
+        pref: vim keybindings
+    questions:
+      - ask: which keybindings does the cinder team use in the shared editor
+        disposition: unknown
+        not_current: [vim keybindings]
+        evidence: []
+      - ask: what is the cinder shared editor theme
+        disposition: current
+        answer: solarized dark
+        evidence: [insights/cinder-editor-conventions]
+
+  - id: retired-beside-active-neg
+    family: retired_beside_active
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-editor-conventions
+        title: Beacon editor conventions
+        type: Insight
+        date: "2026-01-25"
+        fm: {entities: [project/beacon], status: active}
+        body: >-
+          Beacon tooling conventions. The team uses emacs keybindings in the shared editor.
+          The shared editor theme is gruvbox. Tabs are four spaces wide.
+    questions:
+      - ask: which keybindings does the beacon team use in the shared editor
+        disposition: current
+        answer: emacs keybindings
+        not_current: [vim keybindings]
+        evidence: [insights/beacon-editor-conventions]
+      - ask: what is the beacon shared editor theme
+        disposition: current
+        answer: gruvbox
+        evidence: [insights/beacon-editor-conventions]
+
+  # ── 14. Intact record, declared conflict ─────────────────────────────────
+  - id: hash-valid-obsolete-pos
+    family: hash_valid_obsolete
+    control: positive
+    project: atlas
+    events:
+      - op: save
+        ref: insights/atlas-cross-region-budget
+        title: Atlas cross-region latency budget
+        type: Insight
+        date: "2026-02-11"
+        fm:
+          entities: [project/atlas]
+          epistemic: fact
+          contradicts: [insights/atlas-cross-region-budget-alt]
+        body: The atlas cross-region latency budget is 80 ms.
+      - op: save
+        ref: insights/atlas-cross-region-budget-alt
+        title: Atlas cross-region latency budget, alternate measurement
+        type: Insight
+        date: "2026-02-12"
+        fm: {entities: [project/atlas], epistemic: fact}
+        body: The atlas cross-region latency budget is 40 ms.
+    questions:
+      - ask: what is the atlas cross-region latency budget
+        disposition: contested
+        sides: [80 ms, 40 ms]
+        evidence: [insights/atlas-cross-region-budget, insights/atlas-cross-region-budget-alt]
+        qualifiers: [incomparable_observations]
+        note: >-
+          Both records hash clean and both are marked observed; integrity says
+          nothing about which holds. The qualifier checked is the group's
+          reason, not the per-side `contradicts:` tag — the shipped renderer
+          prints qualifiers on a selected assertion but not on a conflict
+          side, which the report records as a presentation gap.
+
+  - id: hash-valid-obsolete-neg
+    family: hash_valid_obsolete
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-cross-region-budget
+        title: Beacon cross-region latency budget
+        type: Insight
+        date: "2026-02-11"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: The beacon cross-region latency budget is 60 ms.
+    questions:
+      - ask: what is the beacon cross-region latency budget
+        disposition: current
+        answer: 60 ms
+        not_current: [30 ms]
+        evidence: [insights/beacon-cross-region-budget]
+
+  # ── 15. File touch and summary regeneration ──────────────────────────────
+  - id: touch-or-regeneration-pos
+    family: touch_or_regeneration
+    control: positive
+    project: cinder
+    events:
+      - op: save
+        ref: decisions/cinder-release-cadence-v1
+        title: Cinder release cadence
+        type: Decision
+        date: "2026-01-15"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder release cadence is monthly.
+      - op: save
+        ref: decisions/cinder-release-cadence-v2
+        title: Cinder release cadence, revised
+        type: Decision
+        date: "2026-05-20"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder release cadence is weekly.
+      - op: supersede_record
+        ref: decisions/cinder-release-cadence-v1
+        by: decisions/cinder-release-cadence-v2
+        reason: cadence shortened
+      - op: touch
+        ref: decisions/cinder-release-cadence-v1
+    questions:
+      - ask: what is the cinder release cadence
+        disposition: current
+        answer: weekly
+        not_current: [monthly]
+        evidence: [decisions/cinder-release-cadence-v2]
+        qualifiers: ["2026-05-20"]
+
+  - id: touch-or-regeneration-neg
+    family: touch_or_regeneration
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-release-cadence
+        title: Beacon release cadence
+        type: Decision
+        date: "2026-01-15"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon release cadence is monthly.
+      - op: touch
+        ref: decisions/beacon-release-cadence
+    questions:
+      - ask: what is the beacon release cadence
+        disposition: current
+        answer: monthly
+        not_current: [weekly]
+        evidence: [decisions/beacon-release-cadence]
+        qualifiers: ["2026-01-15"]
+
+  # ── 16. Missing target, link cycle, or branch ────────────────────────────
+  - id: missing-target-or-cycle-pos
+    family: missing_target_or_cycle
+    control: positive
+    project: atlas
+    before:
+      at: 1
+      ask: who is the atlas DNS provider
+      answer: Route 53
+    events:
+      - op: save
+        ref: decisions/atlas-dns-provider
+        title: Atlas DNS provider
+        type: Decision
+        date: "2026-01-11"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas DNS provider is Route 53.
+      - op: set_frontmatter
+        ref: decisions/atlas-dns-provider
+        fm: {superseded_by: decisions/atlas-dns-provider-v2}
+      - op: save
+        ref: decisions/atlas-cdn-a
+        title: Atlas CDN, first branch
+        type: Decision
+        date: "2026-02-11"
+        fm: {entities: [project/atlas], superseded_by: decisions/atlas-cdn-b}
+        body: The atlas content delivery network is Fastly.
+      - op: save
+        ref: decisions/atlas-cdn-b
+        title: Atlas CDN, second branch
+        type: Decision
+        date: "2026-02-12"
+        fm: {entities: [project/atlas], superseded_by: decisions/atlas-cdn-a}
+        body: The atlas content delivery network is Cloudflare.
+    questions:
+      - ask: who is the atlas DNS provider
+        disposition: unknown
+        not_current: [Route 53]
+        evidence: [decisions/atlas-dns-provider]
+      - ask: which content delivery network does atlas use
+        disposition: unknown
+        not_current: [Fastly, Cloudflare]
+        evidence: []
+
+  - id: missing-target-or-cycle-neg
+    family: missing_target_or_cycle
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-dns-provider
+        title: Beacon DNS provider
+        type: Decision
+        date: "2026-01-11"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon DNS provider is Route 53.
+      - op: save
+        ref: decisions/beacon-dns-provider-v2
+        title: Beacon DNS provider, revised
+        type: Decision
+        date: "2026-03-11"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon DNS provider is NS1.
+      - op: supersede_record
+        ref: decisions/beacon-dns-provider
+        by: decisions/beacon-dns-provider-v2
+        reason: migrated
+    questions:
+      - ask: who is the beacon DNS provider
+        disposition: current
+        answer: NS1
+        not_current: [Route 53]
+        evidence: [decisions/beacon-dns-provider-v2]
+
+  # ── 17. Hidden linked source ─────────────────────────────────────────────
+  - id: hidden-linked-source-pos
+    family: hidden_linked_source
+    control: positive
+    project: atlas
+    forbidden:
+      - Confidential atlas audit finding
+      - signing key rotation lapsed
+    events:
+      - op: save
+        ref: insights/atlas-audit-finding
+        title: Confidential atlas audit finding
+        type: Insight
+        date: "2026-03-20"
+        fm:
+          entities: [project/atlas]
+          visibility: restricted
+          access: [member/auditor-only]
+        body: Confidential — the atlas signing key rotation lapsed in March.
+      - op: save
+        ref: insights/atlas-key-rotation
+        title: Atlas signing key rotation
+        type: Insight
+        date: "2026-03-21"
+        fm:
+          entities: [project/atlas]
+          contradicts: [insights/atlas-audit-finding]
+        body: The atlas signing key rotation runs every 30 days.
+    questions:
+      - ask: how often does the atlas signing key rotate
+        disposition: current
+        answer: every 30 days
+        evidence: [insights/atlas-key-rotation]
+        qualifiers: [target_hidden]
+
+  - id: hidden-linked-source-neg
+    family: hidden_linked_source
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-audit-finding
+        title: Beacon audit finding
+        type: Insight
+        date: "2026-03-20"
+        fm: {entities: [project/beacon], epistemic: fact}
+        body: Audit — the beacon signing key rotation lapsed in March.
+      - op: save
+        ref: insights/beacon-key-rotation
+        title: Beacon signing key rotation
+        type: Insight
+        date: "2026-03-21"
+        fm:
+          entities: [project/beacon]
+          contradicts: [insights/beacon-audit-finding]
+        body: The beacon signing key rotation runs every 30 days.
+    questions:
+      - ask: how often does the beacon signing key rotate
+        disposition: contested
+        sides: [every 30 days, lapsed in March]
+        evidence: [insights/beacon-key-rotation, insights/beacon-audit-finding]
+
+  # ── 18. Concurrent edit / index lag ──────────────────────────────────────
+  - id: concurrent-edit-index-lag-pos
+    family: concurrent_edit_index_lag
+    control: positive
+    project: atlas
+    tags: [stale_index]
+    before:
+      at: 1
+      ask: what is the atlas per-tenant quota
+      answer: 500 objects
+    events:
+      - op: save
+        ref: insights/atlas-tenant-quota
+        title: Atlas per-tenant quota
+        type: Insight
+        date: "2026-02-18"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas per-tenant quota is 500 objects.
+      - op: edit_body
+        ref: insights/atlas-tenant-quota
+        reindex: false
+        body: The atlas per-tenant quota is 2000 objects.
+    questions:
+      - ask: what is the atlas per-tenant quota
+        disposition: current
+        answer: 2000 objects
+        not_current: [500 objects]
+        evidence: [insights/atlas-tenant-quota]
+        qualifiers: [index stale]
+        note: >-
+          The file is authoritative and says 2000; the index still holds 500.
+          The acceptance here is the disclosure — whether the delivery says the
+          index lags — and the behavior column records which arms nonetheless
+          hand the reader the stale wording. Every arm that renders the indexed
+          row fails behaviour here and the baseline, which reads the file,
+          passes: the one case in the corpus where reading raw bytes wins.
+
+  - id: concurrent-edit-index-lag-neg
+    family: concurrent_edit_index_lag
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-tenant-quota
+        title: Beacon per-tenant quota
+        type: Insight
+        date: "2026-02-18"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon per-tenant quota is 500 objects.
+      - op: edit_body
+        ref: insights/beacon-tenant-quota
+        body: The beacon per-tenant quota is 2000 objects.
+    questions:
+      - ask: what is the beacon per-tenant quota
+        disposition: current
+        answer: 2000 objects
+        not_current: [500 objects]
+        evidence: [insights/beacon-tenant-quota]
+
+  # ── 19. Restore, deletion, repeated consolidation ────────────────────────
+  - id: restore-or-deletion-pos
+    family: restore_or_deletion
+    control: positive
+    project: atlas
+    tags: [mechanical, repeated_consolidation]
+    before:
+      at: 1
+      ask: what is the atlas deploy target
+      answer: bare metal
+    events:
+      - op: save
+        ref: projects/atlas-status
+        title: Atlas status
+        type: ProjectSnapshot
+        date: "2026-01-05"
+        fm: {entities: [project/atlas], status: active}
+        body: |
+          - [2026-01-05] The atlas deploy target is bare metal. <!-- fact:atlas-deploy -->
+          - [2026-03-01] The atlas log retention is 30 days. <!-- fact:atlas-retention -->
+      - op: save
+        ref: daily/2026-02-10-atlas
+        title: Atlas February session
+        type: Insight
+        date: "2026-02-10"
+        fm: {entities: [project/atlas]}
+        body: Session notes for atlas. The deploy target moved to Kubernetes this sprint.
+      - op: consolidate
+        pass: nightly
+        ops:
+          - op: SUPERSEDE
+            id: atlas-deploy
+            new_text: "[2026-02-10] The atlas deploy target is Kubernetes."
+            rationale: moved in the February sprint
+      - op: consolidate
+        pass: nightly
+        ops: []
+      - op: consolidate
+        pass: weekly
+        ops: []
+      - op: save
+        ref: insights/atlas-deploy-legacy-note
+        title: Atlas deploy legacy note
+        type: Insight
+        date: "2026-01-20"
+        fm:
+          entities: [project/atlas]
+          superseded_by: projects/atlas-status
+        body: Imported late — an old atlas note saying the deploy target is bare metal.
+      - op: move_to_archive
+        ref: insights/atlas-deploy-legacy-note
+      - op: restore_from_archive
+        ref: insights/atlas-deploy-legacy-note
+    questions:
+      - ask: what is the atlas deploy target
+        disposition: current
+        answer: Kubernetes
+        not_current: [bare metal]
+        evidence: [projects/atlas-status]
+      - ask: what is the atlas log retention
+        disposition: current
+        answer: 30 days
+        evidence: [projects/atlas-status]
+
+  - id: restore-or-deletion-pos-deletion
+    family: restore_or_deletion
+    control: positive
+    project: cinder
+    tags: [mechanical]
+    before:
+      at: 1
+      ask: what is the cinder alerting destination
+      answer: PagerDuty
+    events:
+      - op: save
+        ref: insights/cinder-alerting
+        title: Cinder alerting destination
+        type: Insight
+        date: "2026-02-22"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder alerting destination is PagerDuty.
+      - op: save
+        ref: insights/cinder-dashboards
+        title: Cinder dashboards
+        type: Insight
+        date: "2026-02-23"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder dashboards live in Grafana.
+      - op: delete
+        ref: insights/cinder-alerting
+    questions:
+      - ask: what is the cinder alerting destination
+        disposition: unknown
+        not_current: [PagerDuty]
+        evidence: []
+      - ask: where do the cinder dashboards live
+        disposition: current
+        answer: Grafana
+        evidence: [insights/cinder-dashboards]
+
+  - id: restore-or-deletion-neg
+    family: restore_or_deletion
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: insights/beacon-alerting
+        title: Beacon alerting destination
+        type: Insight
+        date: "2026-02-22"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon alerting destination is PagerDuty.
+      - op: move_to_archive
+        ref: insights/beacon-alerting
+      - op: restore_from_archive
+        ref: insights/beacon-alerting
+    questions:
+      - ask: what is the beacon alerting destination
+        disposition: current
+        answer: PagerDuty
+        evidence: [insights/beacon-alerting]
+
+  # ── 20. Tight token budget ───────────────────────────────────────────────
+  - id: tight-token-budget-pos
+    family: tight_token_budget
+    control: positive
+    project: cinder
+    tags: [release_fixture]
+    budget: {max_items: 8, max_chars: 480, deadline_ms: 5000, hook_max_chars: 900}
+    events:
+      - op: save
+        ref: decisions/cinder-api-version
+        title: Cinder public API version
+        type: Decision
+        date: "2026-03-01"
+        fm: {entities: [project/cinder], status: active}
+        body: The cinder public API version in force is OpenAPI 3.1.
+      - op: save
+        ref: projects/cinder-api-observed
+        title: Cinder public API observed
+        type: ProjectSnapshot
+        date: "2026-04-02"
+        fm:
+          entities: [project/cinder]
+          epistemic: fact
+          contradicts: [decisions/cinder-api-version]
+        body: Observed — the cinder public API still serves OpenAPI 2.0 in production.
+      - op: save
+        ref: insights/cinder-api-note-one
+        title: Cinder API note one
+        type: Insight
+        date: "2026-03-05"
+        fm: {entities: [project/cinder]}
+        body: A note on the cinder public API — the version banner is rendered in the docs header.
+      - op: save
+        ref: insights/cinder-api-note-two
+        title: Cinder API note two
+        type: Insight
+        date: "2026-03-06"
+        fm: {entities: [project/cinder]}
+        body: Another note on the cinder public API — the version string is asserted in contract tests.
+    questions:
+      - ask: which public API version does cinder serve
+        disposition: contested
+        sides: [OpenAPI 3.1, OpenAPI 2.0]
+        evidence: [decisions/cinder-api-version, projects/cinder-api-observed]
+
+  - id: tight-token-budget-neg
+    family: tight_token_budget
+    control: negative
+    project: beacon
+    budget: {max_items: 4, max_chars: 700}
+    events:
+      - op: save
+        ref: decisions/beacon-api-version
+        title: Beacon public API version
+        type: Decision
+        date: "2026-03-01"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon public API version in force is OpenAPI 3.1.
+      - op: save
+        ref: insights/beacon-api-note-one
+        title: Beacon API note one
+        type: Insight
+        date: "2026-03-05"
+        fm: {entities: [project/beacon]}
+        body: A note on the beacon public API — the version banner is rendered in the docs header.
+      - op: save
+        ref: insights/beacon-api-note-two
+        title: Beacon API note two
+        type: Insight
+        date: "2026-03-06"
+        fm: {entities: [project/beacon]}
+        body: Another note on the beacon public API — the version string is asserted in contract tests.
+    questions:
+      - ask: which public API version does beacon serve
+        disposition: current
+        answer: OpenAPI 3.1
+        not_current: [OpenAPI 2.0]
+        evidence: [decisions/beacon-api-version]
+
+  # ── 21. Claim validity / as-of — recorded, deliberately unscored ─────────
+  - id: claim-validity-as-of-pos
+    family: claim_validity_as_of
+    control: positive
+    project: atlas
+    events:
+      - op: save
+        ref: decisions/atlas-tenant-quota-q1
+        title: Atlas tenant quota for the first quarter
+        type: Decision
+        date: "2026-01-01"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas tenant quota for the first quarter of 2026 is 1000 objects.
+      - op: save
+        ref: decisions/atlas-tenant-quota-q2
+        title: Atlas tenant quota for the second quarter
+        type: Decision
+        date: "2026-04-01"
+        fm: {entities: [project/atlas], status: active}
+        body: The atlas tenant quota for the second quarter of 2026 is 2000 objects.
+    questions:
+      - ask: as of the fifteenth of February what was the atlas tenant quota
+        disposition: "deferred:temporal-assertions"
+        note: >-
+          As-of retrieval needs the temporal-assertion schema and its stable
+          state slots, which are deferred to the next release. Recorded so the
+          family stays visible in the coverage table; scored by nothing.
+
+  - id: claim-validity-as-of-neg
+    family: claim_validity_as_of
+    control: negative
+    project: beacon
+    events:
+      - op: save
+        ref: decisions/beacon-tenant-quota
+        title: Beacon tenant quota
+        type: Decision
+        date: "2026-01-01"
+        fm: {entities: [project/beacon], status: active}
+        body: The beacon tenant quota for 2026 is 1000 objects.
+    questions:
+      - ask: as of the fifteenth of February what was the beacon tenant quota
+        disposition: "deferred:temporal-assertions"
+        note: >-
+          The unchanged control for the deferred family — one record, one
+          validity window, no transition. Recorded, not scored.

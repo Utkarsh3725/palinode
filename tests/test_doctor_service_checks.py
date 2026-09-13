@@ -5,8 +5,10 @@ Covers:
   - api_reachable: passes on HTTP 200, fails on connection error, fails on non-200
   - api_status_consistent: passes when /status chunks match disk and fails on obvious DB drift
     footgun (api=0, disk has data), fails when api and disk disagree
-  - watcher_alive: passes when systemctl active (Linux) or ps shows process;
-    fails when neither; macOS path via ps only
+  - watcher_alive: probes the system manager before --user, accepts both
+    palinode-watcher.service and palinode-indexer.service, passes when either
+    manager reports one active (Linux) or ps shows the process; fails when
+    neither; macOS path via ps only
   - watcher_indexes_correct_db: passes when watcher's PALINODE_DIR matches
     config; fails on mismatch; returns info-skip on macOS; warns when no
     PALINODE_DIR in env
@@ -19,6 +21,7 @@ standard: no SQLite mocking).
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -30,6 +33,7 @@ from palinode.diagnostics.checks.watcher import (
     watcher_alive,
     watcher_indexes_correct_db,
     _WATCHER_MODULE,
+    _WATCHER_SERVICES,
 )
 from palinode.diagnostics.types import CheckResult, DoctorContext
 
@@ -332,6 +336,179 @@ class TestWatcherAlive:
         with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=_ps_output_with_watcher(), stderr="")):
             result = watcher_alive(ctx)
         assert result.remediation is None
+
+
+# ---------------------------------------------------------------------------
+# watcher_alive: unit-name and manager probing
+# ---------------------------------------------------------------------------
+
+
+def _systemctl_states(active_unit: str | None) -> str:
+    """Render one `systemctl is-active` state line per candidate unit."""
+    return "".join(
+        f"{'active' if unit == active_unit else 'inactive'}\n"
+        for unit in _WATCHER_SERVICES
+    )
+
+
+def _fake_run_factory(
+    *,
+    system_active: str | None = None,
+    user_active: str | None = None,
+    ps_output: str | None = None,
+    systemctl_exc: Exception | None = None,
+    calls: list[list[str]] | None = None,
+):
+    """Build a subprocess.run stub for systemctl + ps.
+
+    *system_active* / *user_active* name the unit each manager reports as
+    active (None = nothing active). *systemctl_exc* is raised instead of
+    running systemctl, for the "no systemctl binary" and "manager errored"
+    paths.
+    """
+    ps_stdout = ps_output if ps_output is not None else _ps_output_without_watcher()
+
+    def _fake_run(cmd, **kwargs):
+        cmd = list(cmd)
+        if calls is not None:
+            calls.append(cmd)
+        if cmd[0] == "systemctl":
+            if systemctl_exc is not None:
+                raise systemctl_exc
+            active = user_active if "--user" in cmd else system_active
+            stdout = _systemctl_states(active)
+            return mock.Mock(
+                returncode=0 if active is not None else 3, stdout=stdout, stderr=""
+            )
+        return mock.Mock(returncode=0, stdout=ps_stdout, stderr="")
+
+    return _fake_run
+
+
+class TestWatcherAliveUnitProbing:
+    """The check must find the system unit the production host actually runs."""
+
+    @staticmethod
+    def _linux(monkeypatch) -> None:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.delenv("WATCHER_UNIT_NAME", raising=False)
+
+    def test_system_indexer_unit_passes_without_install_advice(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._linux(monkeypatch)
+        calls: list[list[str]] = []
+        fake = _fake_run_factory(
+            system_active="palinode-indexer.service", calls=calls
+        )
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is True
+        assert "system unit palinode-indexer.service is active" in result.message
+        assert "consider installing" not in result.message
+        assert result.remediation is None
+        # System manager is probed first, and ps is never reached.
+        assert calls[0][0] == "systemctl"
+        assert "--user" not in calls[0]
+        assert all(c[0] != "ps" for c in calls)
+
+    def test_user_watcher_unit_passes_and_names_the_manager(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._linux(monkeypatch)
+        calls: list[list[str]] = []
+        fake = _fake_run_factory(
+            user_active="palinode-watcher.service", calls=calls
+        )
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is True
+        assert "user unit palinode-watcher.service is active" in result.message
+        assert "consider installing" not in result.message
+        # System manager probed first, --user second.
+        assert "--user" not in calls[0]
+        assert "--user" in calls[1]
+
+    def test_install_advice_only_when_no_unit_is_active(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._linux(monkeypatch)
+        fake = _fake_run_factory(ps_output=_ps_output_with_watcher(4242))
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is True
+        assert "PID 4242" in result.message
+        assert "consider installing the unit" in result.message
+        assert "palinode-indexer.service" in result.message
+        assert result.remediation is not None
+
+    def test_missing_systemctl_binary_falls_back_to_ps(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._linux(monkeypatch)
+        fake = _fake_run_factory(
+            ps_output=_ps_output_with_watcher(777),
+            systemctl_exc=FileNotFoundError("systemctl"),
+        )
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is True
+        assert "PID 777" in result.message
+
+    def test_both_managers_erroring_falls_through_cleanly(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        self._linux(monkeypatch)
+        calls: list[list[str]] = []
+        fake = _fake_run_factory(
+            systemctl_exc=subprocess.TimeoutExpired(cmd="systemctl", timeout=5),
+            calls=calls,
+        )
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is False
+        assert result.severity == "error"
+        assert result.remediation is not None
+        # Both managers were tried, then ps.
+        assert len([c for c in calls if c[0] == "systemctl"]) == 2
+
+    def test_macos_never_invokes_systemctl(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", "darwin")
+        calls: list[list[str]] = []
+        fake = _fake_run_factory(ps_output=_ps_output_with_watcher(), calls=calls)
+        with mock.patch("subprocess.run", side_effect=fake):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert result.passed is True
+        assert all(c[0] != "systemctl" for c in calls)
+
+    def test_watcher_unit_name_override_is_probed_first(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("WATCHER_UNIT_NAME", "palinode-indexer")
+        calls: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):
+            cmd = list(cmd)
+            calls.append(cmd)
+            if cmd[0] == "systemctl":
+                return mock.Mock(returncode=0, stdout="active\ninactive\n", stderr="")
+            return mock.Mock(returncode=0, stdout=_ps_output_without_watcher(), stderr="")
+
+        with mock.patch("subprocess.run", side_effect=_fake_run):
+            result = watcher_alive(_ctx(tmp_path))
+
+        assert calls[0][2] == "palinode-indexer.service"
+        assert result.passed is True
+        assert "system unit palinode-indexer.service is active" in result.message
 
 
 # ---------------------------------------------------------------------------

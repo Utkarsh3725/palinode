@@ -15,7 +15,6 @@ regenerated corpus carries identical frontmatter every time.
 """
 from __future__ import annotations
 
-import os
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone

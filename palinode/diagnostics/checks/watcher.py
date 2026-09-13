@@ -7,9 +7,12 @@ PALINODE_DIR / db_path.
 Platform notes
 --------------
 On Linux:
-  - watcher_alive: uses ``systemctl --user is-active palinode-watcher.service``
-    as the primary probe, falling back to scanning ``ps -ef`` for a process
-    whose command line contains ``palinode.indexer.watcher``.
+  - watcher_alive: probes ``systemctl is-active`` on the system manager first
+    and ``systemctl --user is-active`` second, for both shipped unit names
+    (``palinode-watcher.service`` and ``palinode-indexer.service``; the
+    installer's ``WATCHER_UNIT_NAME`` override is honoured when exported).
+    Falls back to scanning ``ps -ef`` for a process whose command line
+    contains ``palinode.indexer.watcher``.
   - watcher_indexes_correct_db: reads ``/proc/<pid>/environ`` for the watcher
     PID to compare its PALINODE_DIR against the configured value. This catches
     the case where the watcher is restarted after a directory rename but still
@@ -26,6 +29,7 @@ On macOS:
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,8 +37,13 @@ from pathlib import Path
 from palinode.diagnostics.registry import register
 from palinode.diagnostics.types import CheckResult, DoctorContext
 
-_WATCHER_SERVICE = "palinode-watcher.service"
+# Unit names we accept, in probe order. "palinode-watcher.service" is what
+# deploy/systemd/ ships; "palinode-indexer.service" is the name real
+# deployments installed via the installer's WATCHER_UNIT_NAME override.
+_WATCHER_SERVICES = ("palinode-watcher.service", "palinode-indexer.service")
+_WATCHER_UNIT_ENV = "WATCHER_UNIT_NAME"
 _WATCHER_MODULE = "palinode.indexer.watcher"
+_SYSTEMCTL_TIMEOUT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +81,49 @@ def _find_watcher_pid() -> int | None:
     return None
 
 
-def _systemctl_is_active(service: str) -> bool:
-    """Return True if systemctl reports the unit as active."""
+def _candidate_units() -> tuple[str, ...]:
+    """Return the watcher unit names to probe, in order.
+
+    ``WATCHER_UNIT_NAME`` is the installer's existing knob for renaming the
+    watcher unit (see deploy/systemd/install.sh); when it is exported, that
+    name is probed first. The ``.service`` suffix is optional.
+    """
+    override = os.environ.get(_WATCHER_UNIT_ENV, "").strip()
+    if not override:
+        return _WATCHER_SERVICES
+    if not override.endswith(".service"):
+        override = f"{override}.service"
+    return (override, *(u for u in _WATCHER_SERVICES if u != override))
+
+
+def _systemctl_active_unit(units: tuple[str, ...], *, user: bool) -> str | None:
+    """Return the first unit of *units* the given manager reports as active.
+
+    One ``systemctl is-active`` invocation covers every candidate name:
+    systemd prints one state per unit, in argument order. Returns None when
+    none are active, or when systemctl is missing, errors, or times out.
+    """
+    cmd = ["systemctl"]
+    if user:
+        cmd.append("--user")
+    cmd += ["is-active", *units]
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "is-active", service],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=5,
+            timeout=_SYSTEMCTL_TIMEOUT,
         )
-        return result.returncode == 0 and result.stdout.strip() == "active"
-    except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # strict=False on purpose: a manager that errored prints fewer states
+    # (or none) than units, and that just means "not active".
+    for unit, state in zip(units, result.stdout.split(), strict=False):
+        if state == "active":
+            return unit
+    return None
 
 
 def _read_proc_environ(pid: int) -> dict[str, str]:
@@ -118,27 +156,31 @@ def _read_proc_environ(pid: int) -> dict[str, str]:
 def watcher_alive(ctx: DoctorContext) -> CheckResult:
     """Verify the palinode-watcher process is currently running.
 
-    On Linux: primary check is ``systemctl --user is-active
-    palinode-watcher.service``.  Falls back to ``ps -ef`` scan if systemctl
-    is unavailable (e.g. the unit doesn't exist yet).
+    On Linux: probes ``systemctl is-active`` on the system manager first, then
+    ``--user``, accepting either shipped unit name. Falls back to a ``ps -ef``
+    scan when no unit is active (or systemctl is unavailable), and only then
+    suggests installing a unit.
 
     On macOS: only ``ps -ef`` scan is used. There is no launchd unit yet, so
     the ps scan is best-effort.
     """
     is_linux = sys.platform.startswith("linux")
 
-    # Linux: try systemctl first
+    # Linux: try systemctl first — system manager, then --user
     if is_linux:
-        active = _systemctl_is_active(_WATCHER_SERVICE)
-        if active:
-            return CheckResult(
-                name="watcher_alive",
-                severity="error",
-                passed=True,
-                message=f"systemctl reports {_WATCHER_SERVICE} is active",
-                remediation=None,
-            )
-        # systemctl says not active; also check via ps for non-unit installs
+        units = _candidate_units()
+        for manager, user in (("system", False), ("user", True)):
+            active = _systemctl_active_unit(units, user=user)
+            if active is not None:
+                return CheckResult(
+                    name="watcher_alive",
+                    severity="error",
+                    passed=True,
+                    message=f"systemctl reports {manager} unit {active} is active",
+                    remediation=None,
+                )
+        # No unit active under either manager; check via ps for non-unit installs
+        unit_list = ", ".join(units)
         pid = _find_watcher_pid()
         if pid is not None:
             return CheckResult(
@@ -147,7 +189,8 @@ def watcher_alive(ctx: DoctorContext) -> CheckResult:
                 passed=True,
                 message=(
                     f"Watcher process found via ps (PID {pid}); "
-                    f"systemctl unit '{_WATCHER_SERVICE}' is not active — "
+                    f"no systemctl unit ({unit_list}) is active under the "
+                    f"system or user manager — "
                     f"consider installing the unit for auto-restart on reboot."
                 ),
                 remediation=(
@@ -161,8 +204,8 @@ def watcher_alive(ctx: DoctorContext) -> CheckResult:
             severity="error",
             passed=False,
             message=(
-                f"Watcher is not running: "
-                f"'{_WATCHER_SERVICE}' is inactive and no matching process found in ps."
+                f"Watcher is not running: no unit ({unit_list}) is active under "
+                f"the system or user manager and no matching process found in ps."
             ),
             remediation=(
                 "Start the watcher: 'systemctl --user start palinode-watcher' "

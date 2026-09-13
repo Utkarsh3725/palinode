@@ -22,6 +22,11 @@ Run JSON and Markdown forms independently of the stable benchmark runner::
 
     python -m bench.abstention --out abstention.json
     python -m bench.abstention --format markdown --out abstention.md
+
+Compare the shipped relative BM25 floor with no BM25 filtering::
+
+    python -m bench.abstention --fts-threshold 0.4 --out relative.json
+    python -m bench.abstention --fts-threshold 0.0 --out unfiltered.json
 """
 from __future__ import annotations
 
@@ -208,6 +213,10 @@ def summarize_observations(
         },
         "no_answer_by_kind": by_kind,
         "controls": controls,
+        # Results that reached the merged set through BM25 alone. Zero in the
+        # vector arm by construction, and the number that says whether the
+        # hybrid arm added anything at this floor.
+        "fts_only_results": sum(row.get("fts_only_count") or 0 for row in observations),
         "false_positive_scores": {
             "fused": _score_stats(
                 [
@@ -229,6 +238,11 @@ def summarize_observations(
 
 def _matches_topic(result: dict[str, Any], expected_topic: str) -> bool:
     return expected_topic.casefold() in str(result.get("content", "")).casefold()
+
+
+def _result_key(result: dict[str, Any]) -> str:
+    """The identity the ranker fuses and dedups on."""
+    return f"{result['file_path']}#{result.get('section_id', 'root')}"
 
 
 def _observation(case: QueryCase, results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -267,6 +281,14 @@ def _observation(case: QueryCase, results: list[dict[str, Any]]) -> dict[str, An
         else None,
         "true_match_rank": true_match_rank,
         "best_true_raw_score": best_true_raw_score,
+        # What the arms actually returned, in order. The counted metrics above
+        # are blind to a reordering, so without these the vector and hybrid
+        # rows are identical whenever BM25 changes rank but not membership.
+        "result_keys": [_result_key(result) for result in results],
+        # rank_hybrid attaches raw_score only to candidates the vector arm
+        # produced, so a result without one reached the merged set through
+        # BM25 alone.
+        "fts_only_count": sum(1 for result in results if result.get("raw_score") is None),
     }
 
 
@@ -275,6 +297,7 @@ def _measure(
     query_vectors: dict[str, list[float]],
     *,
     threshold: float,
+    fts_threshold: float,
     top_k: int,
     mode: str,
 ) -> dict[str, Any]:
@@ -288,6 +311,7 @@ def _measure(
             query_vectors[case.case_id],
             top_k=top_k,
             threshold=threshold,
+            fts_threshold=fts_threshold,
             use_fts=use_fts,
             record_access=False,
         )
@@ -298,6 +322,90 @@ def _measure(
         "summary": summarize_observations(observations),
         "observations": observations,
     }
+
+
+def _fts_candidate_stats(
+    cases: Sequence[QueryCase], *, top_k: int
+) -> dict[str, Any]:
+    """The BM25 candidate scores its independent relative floor is applied to.
+
+    ``search_fts`` normalizes BM25 as ``min(abs(rank) / 25.0, 1.0)``, a scale
+    with no relation to the cosine similarity the vector arm is scored on. The
+    relative floor compares each score with the top score in the same slate, so
+    this records the absolute scores and corpus-size effects behind that ratio.
+    """
+    from palinode.core import store
+
+    scores: list[float] = []
+    cases_with_candidates = 0
+    for case in cases:
+        rows = store.search_fts(case.query, top_k=top_k * 2)
+        if not rows:
+            continue
+        cases_with_candidates += 1
+        scores.extend(float(row.get("score", 0.0)) for row in rows)
+    return {
+        "cases": len(cases),
+        "cases_with_candidates": cases_with_candidates,
+        "candidates": len(scores),
+        "score_stats": _score_stats(scores),
+    }
+
+
+def compare_arms(
+    vector_measurement: dict[str, Any], hybrid_measurement: dict[str, Any]
+) -> dict[str, Any]:
+    """How the hybrid arm differs from the vector arm at one floor.
+
+    The counted metrics cannot see this. Two arms that return the same number
+    of results for every case, with the same control hits, produce identical
+    summary rows whether BM25 changed the ordering or was dropped entirely.
+    """
+    vector_rows = {row["case_id"]: row for row in vector_measurement["observations"]}
+    hybrid_rows = {row["case_id"]: row for row in hybrid_measurement["observations"]}
+    shared = sorted(vector_rows.keys() & hybrid_rows.keys())
+
+    differing = 0
+    reordered = 0
+    membership_changed = 0
+    for case_id in shared:
+        vector_keys = vector_rows[case_id]["result_keys"]
+        hybrid_keys = hybrid_rows[case_id]["result_keys"]
+        if vector_keys == hybrid_keys:
+            continue
+        differing += 1
+        if set(vector_keys) == set(hybrid_keys):
+            reordered += 1
+        else:
+            membership_changed += 1
+
+    return {
+        "threshold": vector_measurement["threshold"],
+        "cases": len(shared),
+        "cases_differing": differing,
+        "cases_reordered_only": reordered,
+        "cases_membership_changed": membership_changed,
+        "fts_only_results": hybrid_measurement["summary"]["fts_only_results"],
+    }
+
+
+def _arm_comparisons(
+    measurements: Sequence[dict[str, Any]], thresholds: Sequence[float]
+) -> list[dict[str, Any]]:
+    comparisons = []
+    for threshold in thresholds:
+        vector_measurement = next(
+            row
+            for row in measurements
+            if row["mode"] == "vector" and row["threshold"] == threshold
+        )
+        hybrid_measurement = next(
+            row
+            for row in measurements
+            if row["mode"] == "hybrid" and row["threshold"] == threshold
+        )
+        comparisons.append(compare_arms(vector_measurement, hybrid_measurement))
+    return comparisons
 
 
 def _aggregate(
@@ -325,6 +433,33 @@ def _aggregate(
     return aggregate
 
 
+def _aggregate_arm_comparisons(
+    runs: Sequence[dict[str, Any]], thresholds: Sequence[float]
+) -> list[dict[str, Any]]:
+    """Sum the per-seed arm comparisons at each floor."""
+    aggregate = []
+    for threshold in thresholds:
+        rows = [
+            row
+            for run in runs
+            for row in run["arm_comparison"]
+            if row["threshold"] == threshold
+        ]
+        aggregate.append(
+            {
+                "threshold": threshold,
+                "cases": sum(row["cases"] for row in rows),
+                "cases_differing": sum(row["cases_differing"] for row in rows),
+                "cases_reordered_only": sum(row["cases_reordered_only"] for row in rows),
+                "cases_membership_changed": sum(
+                    row["cases_membership_changed"] for row in rows
+                ),
+                "fts_only_results": sum(row["fts_only_results"] for row in rows),
+            }
+        )
+    return aggregate
+
+
 def _package_version() -> str:
     try:
         return version("palinode")
@@ -337,6 +472,7 @@ def evaluate(
     seeds: Sequence[int] = (1337, 2026, 9001),
     size: int = 60,
     thresholds: Sequence[float] = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60),
+    fts_threshold: float | None = None,
     top_k: int = 5,
     cases: Sequence[QueryCase] = DEFAULT_QUERY_CASES,
 ) -> dict[str, Any]:
@@ -356,6 +492,13 @@ def evaluate(
         raise ValueError("top_k must be positive")
     if not thresholds or any(value < 0.0 or value > 1.0 for value in thresholds):
         raise ValueError("thresholds must contain values between 0.0 and 1.0")
+    resolved_fts_threshold = (
+        float(config.search.fts_threshold)
+        if fts_threshold is None
+        else float(fts_threshold)
+    )
+    if resolved_fts_threshold < 0.0:
+        raise ValueError("fts_threshold must be non-negative")
     dimensions = int(config.embeddings.primary.dimensions)
     query_vectors: dict[str, list[float]] = {}
     try:
@@ -394,6 +537,7 @@ def evaluate(
                             cases,
                             query_vectors,
                             threshold=threshold,
+                            fts_threshold=resolved_fts_threshold,
                             top_k=top_k,
                             mode=mode,
                         )
@@ -404,6 +548,8 @@ def evaluate(
                     "num_files": generated.num_files,
                     "num_chunks": indexed.num_facts,
                     "measurements": measurements,
+                    "arm_comparison": _arm_comparisons(measurements, thresholds),
+                    "fts_candidates": _fts_candidate_stats(cases, top_k=top_k),
                 }
             )
 
@@ -422,6 +568,7 @@ def evaluate(
             "size": size,
             "thresholds": list(thresholds),
             "top_k": top_k,
+            "fts_threshold": resolved_fts_threshold,
             "modes": list(MODES),
             "query_counts": query_kind_counts(cases),
             "production_defaults_changed": False,
@@ -429,6 +576,7 @@ def evaluate(
         "runs": runs,
     }
     results["aggregate"] = _aggregate(runs, thresholds)
+    results["arm_comparison"] = _aggregate_arm_comparisons(runs, thresholds)
     return results
 
 
@@ -459,6 +607,8 @@ def render_markdown(results: dict[str, Any]) -> str:
         f"- Embedder: {env['embedding_model']} ({env['embedding_dimensions']} dimensions)",
         f"- Corpus seeds: {', '.join(str(seed) for seed in params['seeds'])}",
         f"- Corpus size: {params['size']} files per seed; top-k: {params['top_k']}",
+        "- BM25 relative floor: "
+        f"{params.get('fts_threshold', 0.0):.2f} x top keyword score",
         "- Query protocol: "
         f"{sum(counts.get(kind, 0) for kind in ABSENT_KINDS)} no-answer queries "
         f"and {sum(counts.get(kind, 0) for kind in CONTROL_KINDS)} answer-present controls per seed",
@@ -492,6 +642,53 @@ def render_markdown(results: dict[str, Any]) -> str:
             )
         lines.extend(["", "Scores describe only false-positive result sets.", ""])
 
+    lines.extend(
+        [
+            "## BM25 arm contribution",
+            "",
+            "The two arms are scored on different axes: each table threshold is the real "
+            "cosine floor for the vector arm, while BM25 uses the independent relative "
+            f"`fts_threshold` ({params.get('fts_threshold', 0.0):.2f} x the best keyword "
+            "score in that result set). This table is what separates the arms; the counted "
+            "metrics above cannot, because they are blind to a reordering.",
+            "",
+            "| Threshold | Cases where hybrid differs from vector | Reordered only | Membership changed | Results from BM25 alone |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in results.get("arm_comparison", []):
+        lines.append(
+            f"| {row['threshold']:.2f} "
+            f"| {row['cases_differing']}/{row['cases']} "
+            f"| {row['cases_reordered_only']} "
+            f"| {row['cases_membership_changed']} "
+            f"| {row['fts_only_results']} |"
+        )
+
+    runs_with_candidates = [
+        run for run in results.get("runs", []) if run.get("fts_candidates")
+    ]
+    if runs_with_candidates:
+        lines.extend(
+            [
+                "",
+                "Normalized BM25 candidate scores per seed, before any floor is applied "
+                "(min / median / max):",
+                "",
+                "| Seed | Queries with a BM25 candidate | Candidates | Score min / median / max |",
+                "|---:|---:|---:|---:|",
+            ]
+        )
+        for run in runs_with_candidates:
+            candidates = run["fts_candidates"]
+            lines.append(
+                f"| {run['seed']} "
+                f"| {candidates['cases_with_candidates']}/{candidates['cases']} "
+                f"| {candidates['candidates']} "
+                f"| {_format_score_stats(candidates['score_stats'])} |"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -521,6 +718,14 @@ def main(argv: list[str] | None = None) -> int:
         default=(0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60),
     )
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--fts-threshold",
+        type=float,
+        help=(
+            "BM25 floor as a fraction of the best keyword score "
+            "(default: configured search.fts_threshold)"
+        ),
+    )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
@@ -530,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
             seeds=args.seeds,
             size=args.size,
             thresholds=args.thresholds,
+            fts_threshold=args.fts_threshold,
             top_k=args.top_k,
         )
     except (RuntimeError, ValueError) as exc:

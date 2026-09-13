@@ -87,7 +87,7 @@ That's the entire client config. Works with Claude Code, Claude Desktop, Cursor,
 
 **Index** — A file watcher embeds with BGE-M3 and indexes with FTS5 as you save. Content-hash dedup skips re-embedding unchanged files (~90% savings). Single SQLite file, zero external services.
 
-**Search** — Hybrid BM25 + vector search merged with Reciprocal Rank Fusion. Keyword precision when you need exact terms, semantic recall when you don't. Optional associative entity graph and prospective triggers.
+**Search** — Hybrid BM25 + vector search merged with Reciprocal Rank Fusion. The two arms have different jobs: on full-sentence questions the vector arm does nearly all the retrieval (FTS5 requires every query token to co-occur, which questions rarely satisfy), while BM25 catches the exact terms and identifiers embeddings blur. Measured together: 0.981 evidence recall@10 on LongMemEval_S ([benchmarks](docs/BENCHMARKS.md)). Optional associative entity graph and prospective triggers.
 
 **Compact** — Weekly consolidation where an LLM returns structured operations and Palinode validates and applies them. Every compaction is a git commit you can review, blame, or revert.
 
@@ -101,9 +101,11 @@ That's the entire client config. Works with Claude Code, Claude Desktop, Cursor,
 
 - **Python 3.11+**
 - **Git**
-- **Ollama** with `bge-m3` (`ollama pull bge-m3`, ≈1.2 GB) — for semantic search.
-  **Optional:** without an embedder Palinode runs in **keyword-only mode** (BM25/FTS5) — save,
-  search, and audit all still work; you just don't get vector recall until you add one.
+- **Ollama** with `bge-m3` (`ollama pull bge-m3`, ≈1.2 GB), or another supported
+  embedding endpoint — for search. Saves persist without an embedder, but search
+  returns HTTP 503 until it is reachable (`palinode resolve` degrades to
+  keyword-only and says so). See the
+  [Homebrew setup guide](docs/HOMEBREW.md) for installation and verification.
 
 Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSON), OpenClaw for agent plugin hooks.
 
@@ -111,16 +113,17 @@ Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSO
 
 ## Install
 
-**Homebrew (macOS/Linux) — quickest path to the CLI:**
+**Homebrew (macOS/Linux) — local installation:**
 
 ```bash
 brew install phasespace-labs/palinode/palinode
 palinode --version
 ```
 
-That taps and installs in one command. It puts the `palinode` CLI on your PATH; the
-service binaries (`palinode-api`, `palinode-watcher`, `palinode-mcp`) currently live in
-the tap's private prefix, so for running services use the source install below or Docker.
+That installs the CLI, API, watcher, and MCP executables with their Python dependencies.
+Follow the [Homebrew setup guide](docs/HOMEBREW.md) to create your private memory
+directory, start the services, connect your editor, and verify your first saved memory.
+The guide also covers upgrades and service restarts.
 
 **From source — the full-stack path.** Clone, install, point at a memory directory,
 check it worked:
@@ -136,7 +139,10 @@ mkdir -p ~/.palinode && cd ~/.palinode && git init
 cp ~/palinode-src/palinode.config.yaml.example palinode.config.yaml
 # memory_dir stays commented out in the copied config → it inherits PALINODE_DIR below
 
-# 3. Start the services (each in its own terminal — or as a service, next section)
+# 3. Start the services — one command, or each in its own terminal
+PALINODE_DIR=~/.palinode palinode start       # API + watcher from one foreground command
+
+# ...or run them separately (separate logs — or as a service, next section)
 PALINODE_DIR=~/.palinode palinode-api        # REST API on :6340
 PALINODE_DIR=~/.palinode palinode-watcher     # auto-indexes on file save
 
@@ -197,6 +203,8 @@ Projects that use other harnesses get the same memory instructions automatically
 
 ## Usage Examples
 
+A few common flows. Every command and option is in [docs/CLI.md](docs/CLI.md).
+
 ### Save a decision, recall it later
 
 ```bash
@@ -241,12 +249,15 @@ palinode archive insights/stale-finding.md --reason "superseded by the re-run" \
 
 ## Tools
 
-29 tools available through every interface:
+Tools available through every interface (the full inventory, with parameters, is
+the table in [docs/MCP-SETUP.md](docs/MCP-SETUP.md) — a prose count here only
+drifts):
 
 | Tool | What It Does |
 |------|-------------|
 | `session_init` | Session-start context digest for the resolved project scope |
-| `search` | Hybrid BM25 + vector search with category filter |
+| `search` | Hybrid BM25 + vector search with category filter; `resolve` attaches bounded evidence and a resolution per hit |
+| `resolve` | What memory holds *right now* for a question or one record — what stands, what replaced what, conflicts with both sides intact, and what is explicitly unknown |
 | `save` | Store a typed memory (person, decision, insight, project) |
 | `list` | Browse memory files by type, filter by core status |
 | `read` | Read the full content of a memory file |
@@ -255,6 +266,9 @@ palinode archive insights/stale-finding.md --reason "superseded by the re-run" \
 | `entities` | Entity graph — cross-references between memories |
 | `consolidate` | Preview or run LLM-powered compaction |
 | `archive` | Retire one memory that's wrong or obsolete — archive it, or supersede it with a named replacement |
+| `restore` | Bring an archived memory back into default recall — the inverse of `archive` |
+| `unretract` | Withdraw one preference's mention-level retraction from one memory |
+| `forget_withdraw` | Take a forget request back — restore what it archived, un-strike what it retracted |
 | `archive_expired` | Archive ephemeral memories whose TTL has expired |
 | `diff` | What changed in the last N days |
 | `blame` | Trace a fact back to the commit that recorded it |
@@ -275,7 +289,9 @@ palinode archive insights/stale-finding.md --reason "superseded by the re-run" \
 | `topic_coverage` | Given a short topic phrase, return whether any existing wiki page already covers it (binary `covered` / `best_match` / `similarity`) |
 | `depends` | Dependency tree (or unblocked-items list) from `depends_on` / `blocks` / `parallel_with` frontmatter on ProjectSnapshots |
 
-Every tool is accessible as `palinode_<name>` via MCP, `palinode <name>` via CLI, or `POST/GET /<name>` via the REST API.
+Every tool is accessible as `palinode_<name>` via MCP, `palinode <name>` via CLI (hyphenated: `palinode archive-expired`; `session_init` is `palinode prime`; `doctor_deep` has no separate CLI command), or `POST/GET /<name>` via the REST API.
+
+The CLI has more commands than the tool list — service control, migration, repair, and wiki-maintenance helpers. **[docs/CLI.md](docs/CLI.md) is the full command reference**, one entry per command with options, defaults, and output behaviour.
 
 ---
 
@@ -286,7 +302,7 @@ Every tool is accessible as `palinode_<name>` via MCP, `palinode <name>` via CLI
 | Source of truth | Markdown + YAML frontmatter | Human-readable, git-versioned, portable |
 | Vector index | SQLite-vec (embedded) | No server, single file, zero config |
 | Keyword index | SQLite FTS5 (embedded) | BM25 for exact terms, zero dependencies |
-| Embeddings | BGE-M3 via Ollama | Local, private, no API key needed |
+| Embeddings | BGE-M3 via Ollama, or any OpenAI-compatible `/v1/embeddings` server | Local, private, no API key needed |
 | API | FastAPI | Lightweight, async, one process |
 | MCP | Python MCP SDK (Streamable HTTP) | Works with every IDE over the network |
 | CLI | Click (wraps REST API) | Shell-native, TTY-aware output |
@@ -373,6 +389,17 @@ consolidation:
 
 All models are swappable. Any Ollama embedding model, any OpenAI-compatible chat endpoint. See [palinode.config.yaml.example](palinode.config.yaml.example) for the full reference.
 
+**Embeddings without Ollama.** llama.cpp (`llama-server --embedding`), vLLM, and LM Studio all expose the OpenAI-compatible `/v1/embeddings` shape; select it with `dialect: openai` (default `ollama`, so existing setups are unchanged). Retry, circuit breaker, and per-input error handling are identical to the Ollama path. The Ollama tag `bge-m3` is not a llama-server model name — point llama-server at a BGE-M3 GGUF instead:
+
+```yaml
+embeddings:
+  primary:
+    dialect: openai
+    url: "http://localhost:8080"   # a trailing /v1 is fine too
+    model: "bge-m3"                # llama-server ignores it; vLLM / LM Studio match it
+    dimensions: 1024
+```
+
 When exposing the API beyond loopback (`PALINODE_API_HOST` other than `127.0.0.1`), set `PALINODE_API_TOKEN` — the server refuses to start unauthenticated on a non-loopback bind unless you opt out explicitly with `PALINODE_API_ALLOW_UNAUTH=1`. See [SECURITY.md](SECURITY.md#api-authentication) for the bearer-token auth model and the bind gate.
 
 ---
@@ -385,7 +412,7 @@ When exposing the API beyond loopback (`PALINODE_API_HOST` other than `127.0.0.1
 | `POST` | `/search` | Hybrid search with filters |
 | `POST` | `/search-associative` | Entity graph traversal |
 | `POST` | `/save` | Create a typed memory file. Schema: `{content, type, slug?, entities?, title?}`. Body cap **5 MB** (override via `PALINODE_MAX_REQUEST_BYTES`). |
-| `POST` | `/ingest-url` | Fetch URL, save as research |
+| `POST` | `/ingest-url` | Fetch URL, save as research. The URL and each redirect target (five hops at most) are validated before they are requested: a host must resolve only to globally routable addresses. The connection is not pinned to the validated address. |
 | `GET/POST` | `/triggers` | Prospective recall triggers |
 | `POST` | `/consolidate` | Run or preview compaction |
 | `GET` | `/list` | Browse files by type |
@@ -428,6 +455,9 @@ When exposing the API beyond loopback (`PALINODE_API_HOST` other than `127.0.0.1
 - **4-phase injection** — Core (always) + Topic (per-turn search) + Associative (entity graph) + Triggered (prospective recall).
 - **Multi-transport MCP** — stdio for local, Streamable HTTP for remote. One server, any IDE on any machine.
 - **If everything crashes, `cat` still works.**
+
+Measured, not asserted: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has LongMemEval results
+with methodology, cost, and the losses.
 
 ---
 

@@ -25,6 +25,10 @@
     <li><a href="{{ url_for('ui_memory', file_path=r.id) }}">{{ r.path }}
       {% if r.type %}<span class="meta">· {{ r.type }}</span>{% endif %}
       <span class="meta">· {{ r.score }}</span>
+      {% if r.index_agreement == "valid" %}<span class="meta">· index matches source</span>
+      {% elif r.index_agreement == "stale" %}<span class="meta">· ⚠ index stale</span>{% endif %}
+      {% if r.currency == "retired" %}<span class="meta">· ⚠ retired{% if r.currency_reason %}: {{ r.currency_reason }}{% endif %}</span>
+      {% elif r.currency == "contested" %}<span class="meta">· ⚠ contested</span>{% endif %}
       {% if r.snippet %}<div class="snippet">{{ r.snippet }}</div>{% endif %}</a></li>
     {% endfor %}
   </ul>

@@ -188,7 +188,8 @@ def test_cli_search_prefers_snippet_over_blind_truncation(monkeypatch):
     }]
 
     def _fake_search(*_a, **_kw):
-        return fake_results
+        # The CLI asks for the delivery receipt, so the client returns a pair.
+        return fake_results, None
 
     monkeypatch.setattr(search_module.api_client, "search", _fake_search)
 
@@ -214,7 +215,7 @@ def test_cli_search_legacy_fallback_when_no_snippet(monkeypatch):
     }]
 
     monkeypatch.setattr(
-        search_module.api_client, "search", lambda *_a, **_kw: fake_results
+        search_module.api_client, "search", lambda *_a, **_kw: (fake_results, None)
     )
 
     runner = CliRunner()

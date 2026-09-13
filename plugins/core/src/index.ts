@@ -14,6 +14,8 @@
  *   - recall → injection TEXT (triggers + strict search, bounded)
  *   - session-start priming digest
  *   - the capture-floor payload for /session-end
+ *   - the reversal client (restore / unretract / forget-withdraw), so a
+ *     binding that exposes archival can expose its undo on the same path
  *
  * Design contract (shared with the Claude Code hooks — same knobs, same
  * semantics, same env var names):
@@ -48,6 +50,15 @@ export interface PalinodeConfig {
   maxChars: number;
   /** Per-request timeout in milliseconds. */
   timeoutMs: number;
+  /** Route per-turn recall through bounded resolution (`POST /resolve`). */
+  resolveOn: boolean;
+  /**
+   * Per-turn deadline for bounded resolution, in milliseconds. Separate from
+   * `timeoutMs` on purpose: this one is spent on EVERY prompt, so it is a
+   * latency budget rather than a failure timeout. Past it, the turn falls back
+   * to plain search with an explicit marker (see `RESOLUTION_DEADLINE_MARKER`).
+   */
+  resolveDeadlineMs: number;
   /** Max core memories in the session-start digest; 0 disables priming. */
   coreMaxFiles: number;
   /** Total cap on the session-start digest. */
@@ -135,6 +146,11 @@ export function configFromEnv(
     minChars: num(env, "PALINODE_HOOK_RECALL_MIN_CHARS", 12),
     maxChars: num(env, "PALINODE_HOOK_RECALL_MAX_CHARS", 3000),
     timeoutMs: num(env, "PALINODE_HOOK_RECALL_TIMEOUT", 4) * 1000,
+    resolveOn:
+      env.PALINODE_HOOK_RESOLVE === undefined || env.PALINODE_HOOK_RESOLVE === ""
+        ? true
+        : env.PALINODE_HOOK_RESOLVE !== "0",
+    resolveDeadlineMs: num(env, "PALINODE_HOOK_RESOLVE_DEADLINE", 250),
     coreMaxFiles: num(env, "PALINODE_HOOK_INJECT_MAX_FILES", profile.coreMaxFiles),
     coreMaxChars: num(env, "PALINODE_HOOK_INJECT_MAX_CHARS", 4000),
     minMessages: num(env, "PALINODE_HOOK_MIN_MESSAGES", 3),
@@ -153,7 +169,7 @@ export async function apiJson(
   cfg: PalinodeConfig,
   fetchFn: FetchFn,
   path: string,
-  init?: { method?: string; body?: unknown },
+  init?: { method?: string; body?: unknown; timeoutMs?: number },
 ): Promise<unknown | null> {
   try {
     const headers: Record<string, string> = {};
@@ -163,7 +179,10 @@ export async function apiJson(
       method: init?.method ?? (init?.body !== undefined ? "POST" : "GET"),
       headers,
       body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
-      signal: AbortSignal.timeout(cfg.timeoutMs),
+      // `timeoutMs` overrides the config default for one call — what makes a
+      // per-turn deadline (250 ms) expressible without shortening the failure
+      // timeout every other call depends on.
+      signal: AbortSignal.timeout(init?.timeoutMs ?? cfg.timeoutMs),
     });
     if (!res.ok) return null;
     return await res.json();
@@ -178,17 +197,217 @@ interface SearchHit {
   /** Post-fusion rank value — ~1.0 for any query's top hit. Display fallback only. */
   score?: number;
   /** Raw cosine — the scale the threshold knob filters on. Preferred for display. */
-  raw_score?: number;
+  raw_score?: number | null;
   snippet?: string;
   content?: string;
+}
+
+/** Keep aligned with palinode/core/scoring.py; the packages remain independently deployable. */
+function describeMatch(result: SearchHit): string {
+  const rank = (result.score ?? 0).toFixed(2);
+  if (result.raw_score === null) return `keyword match, rank ${rank}`;
+  if (typeof result.raw_score === "number") {
+    return `${Math.round(result.raw_score * 100)}% match`;
+  }
+  return `rank ${rank}`;
 }
 
 interface FiredTrigger {
   memory_file?: string;
 }
 
+/** The qualified bundle `POST /resolve` returns. Fields this adapter reads. */
+export interface ResolveBundle {
+  /** The rendered bundle — one deterministic template, shared by every surface. */
+  text?: string;
+  selected?: unknown[];
+  conflicts?: unknown[];
+  replaced?: unknown[];
+  insufficient?: unknown[];
+  coverage?: { status?: string; reasons?: string[] };
+  omitted_conflicts?: number;
+  receipt_ref?: string | null;
+}
+
 /**
- * Per-turn recall: prospective triggers + strict-threshold search.
+ * What the turn says when resolution did not come back inside its deadline.
+ *
+ * The fallback is today's unresolved search hits, and the difference matters:
+ * one of them may have been replaced or contradicted by a record nobody
+ * checked. Saying so is the whole point — a silent fallback would present a
+ * stale assertion with the authority of a resolved one.
+ */
+/** The fixed frame every per-turn injection carries. Its size is part of the
+ *  budget: what is left after it is what the bundle may spend. */
+const PREAMBLE = `## Palinode recall (this prompt)
+
+Retrieved from persistent memory; may be stale — verify before relying on
+it. More detail: palinode_search / palinode_read.
+`;
+
+/** Below this much remaining room there is no honest answer to give: a bundle
+ *  cannot fit its frame plus the notice naming a contested group, and falling
+ *  back to raw hits would show one side of a conflict as a plain search
+ *  result. The channel says nothing instead. */
+const RESOLVE_MIN_CHARS = 300;
+
+export const RESOLUTION_DEADLINE_MARKER =
+  "_resolution unavailable (deadline) — the memories below are unresolved search " +
+  "hits: a replacement or an open conflict may exist that was not checked. " +
+  "Call palinode_resolve before relying on one._";
+
+/** The marker a contested row carries in every payload the server renders —
+ *  the digest's qualifier and the bundle's contested section both use it. A
+ *  trim that would cut through one drops the whole block instead. */
+const CONTESTED_MARKERS = ["⚠ contradicts", "Contested (", "Still contested"];
+
+/** What the server says when a conflict did not fit; the same wording the
+ *  Python packer emits (`palinode/core/packing.py::_contested_stub`), so a
+ *  reader sees one sentence whichever side had to withhold the group. */
+function contestedStub(blocks: string[]): string {
+  const refs: string[] = [];
+  for (const block of blocks) {
+    for (const m of block.matchAll(/\[([^\]\s]+?\.md|[^\]\s]+?\/[^\]\s]+?)\]/g)) {
+      const key = m[1].endsWith(".md") ? m[1].slice(0, -3) : m[1];
+      if (!refs.some((r) => (r.endsWith(".md") ? r.slice(0, -3) : r) === key)) refs.push(m[1]);
+    }
+  }
+  const where = refs.length ? refs.join(", ") : "no source pointers recorded";
+  const plural = blocks.length === 1 ? "conflict" : "conflicts";
+  return `⚠ ${blocks.length} ${plural} omitted for budget — see ${where}`;
+}
+
+/**
+ * Trim `text` to `maxChars` **at a unit boundary** — never inside one.
+ *
+ * THE RULE THIS EXISTS FOR: a final character slice is how a payload the
+ * server packed honestly arrives dishonest. `text.slice(0, cap)` can cut a
+ * qualifier off a row ("— contradicts insights/b" gone, the claim now reads
+ * settled) or cut a conflict block after its first side, and a contested
+ * claim that loses its counterpart reads as settled. So the cut lands on a
+ * line boundary, a unit that does not fit is dropped whole rather than
+ * halved, and if any dropped line was a contested one, the stub the server
+ * would have emitted is appended in its place — evicting further kept lines
+ * to make room, because "there is a conflict here, here is where" outranks
+ * one more ordinary row.
+ *
+ * A block is a non-indented line plus the indented lines under it (the
+ * bundle renders a row's qualifiers and reasons as indented continuations),
+ * so a row never loses its own qualification.
+ *
+ * Unlike the server-side packer this stops at the first block that does not
+ * fit rather than continuing past it: the packer is choosing units for a
+ * payload it is about to render, while this is trimming a rendered string, and
+ * a hole in the middle of one reads worse than a clean tail cut.
+ */
+export function trimToUnitBoundary(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+
+  const lines = text.split("\n");
+  const blocks: string[][] = [];
+  for (const line of lines) {
+    if (blocks.length > 0 && /^\s/.test(line) && line.trim() !== "") {
+      blocks[blocks.length - 1].push(line);
+    } else {
+      blocks.push([line]);
+    }
+  }
+
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  let used = 0;
+  const cost = (block: string[]) => block.join("\n").length + (kept.length ? 1 : 0);
+  for (const block of blocks) {
+    if (dropped.length === 0 && used + cost(block) <= maxChars) {
+      used += cost(block);
+      kept.push(block.join("\n"));
+    } else {
+      dropped.push(block.join("\n"));
+    }
+  }
+
+  const isContested = (block: string) => CONTESTED_MARKERS.some((m) => block.includes(m));
+  const contested = dropped.filter(isContested);
+  if (contested.length > 0) {
+    for (;;) {
+      const stub = contestedStub(contested);
+      if (used + stub.length + (kept.length ? 1 : 0) <= maxChars) {
+        kept.push(stub);
+        break;
+      }
+      // Below the room for even the notice, nothing is rendered: a fragment
+      // that fit by dropping it would read as settled.
+      if (kept.length === 0) return "";
+      const evicted = kept.pop() as string;
+      used -= evicted.length + (kept.length ? 1 : 0);
+      // An evicted conflict joins the ones the stub names — the count and the
+      // pointers always describe every conflict that is actually missing.
+      if (isContested(evicted)) contested.push(evicted);
+    }
+  }
+  return kept.join("\n");
+}
+
+/**
+ * Bounded resolution for one prompt, under the per-turn deadline.
+ *
+ * Null on anything that is not a usable bundle — deadline, API down, bad
+ * JSON — so the caller can fall back and say that it did.
+ */
+export async function resolveBundle(
+  prompt: string,
+  cfg: PalinodeConfig,
+  fetchFn: FetchFn = fetch,
+  maxChars: number = cfg.maxChars - PREAMBLE.length,
+): Promise<ResolveBundle | null> {
+  const bundle = (await apiJson(cfg, fetchFn, "/resolve", {
+    body: {
+      query: prompt,
+      max_items: Math.max(cfg.maxResults, 1),
+      max_chars: maxChars,
+    },
+    timeoutMs: cfg.resolveDeadlineMs,
+  })) as ResolveBundle | null;
+  if (!bundle || typeof bundle.text !== "string") return null;
+  return bundle;
+}
+
+/** Does this bundle say anything? An empty one is silence, not an answer.
+ *
+ *  `omitted_conflicts` counts: a conflict the server's budget dropped is the
+ *  one thing that is emphatically NOT nothing — the bundle carries it by ref
+ *  precisely so it cannot be mistaken for a settled question. */
+function bundleIsEmpty(bundle: ResolveBundle): boolean {
+  const count = (xs?: unknown[]) => (Array.isArray(xs) ? xs.length : 0);
+  return (
+    count(bundle.selected) +
+      count(bundle.conflicts) +
+      count(bundle.replaced) +
+      count(bundle.insufficient) +
+      (typeof bundle.omitted_conflicts === "number" ? bundle.omitted_conflicts : 0) ===
+    0
+  );
+}
+
+/**
+ * Per-turn recall: prospective triggers + one memory channel.
+ *
+ * ROUTING (the contract this adapter owns; see docs/HOW-MEMORY-WORKS.md):
+ *
+ *   - **Session start** → ordinary priming (`buildCoreDigest`): `/context/prime`
+ *     plus the core digest, under `timeoutMs`. No resolution: a startup digest
+ *     is orientation, not an answer, and its payload stays separate from this
+ *     one.
+ *   - **Per turn** (here) → bounded resolution (`POST /resolve`) under
+ *     `resolveDeadlineMs` (250 ms). Past the deadline the turn falls back to
+ *     today's strict-threshold search, prefixed with
+ *     `RESOLUTION_DEADLINE_MARKER` — never silently.
+ *   - **Explicit follow-up** → `palinode_search` / `palinode_read` /
+ *     `palinode_resolve` as tools. Agent-initiated, no deadline, unbounded by
+ *     this budget. Injection is a starting point; these are the way to the
+ *     rest.
+ *
  * Returns the context block to inject, or null when there is nothing to say.
  */
 export async function buildRecallContext(
@@ -238,27 +457,43 @@ export async function buildRecallContext(
     const lines = results
       .map((r) => {
         const path = r.rel_path ?? r.file_path ?? "?";
-        // raw_score, not score: the fused rank value reads ~100% for the
-        // top hit of ANY query; raw cosine is the threshold knob's scale,
-        // so showing it makes the lever tunable from what the user sees.
-        const pct = Math.floor((r.raw_score ?? r.score ?? 0) * 100);
         const body = (r.snippet ?? r.content ?? "").replace(/\n/g, " ");
-        return `- [${path}] (${pct}%) ${body}`;
+        return `- [${path}] (${describeMatch(r)}) ${body}`;
       })
       .join("\n");
     return `\n### Related memories\n${lines}\n`;
   };
 
-  const sections = (await Promise.all([triggerSection(), searchSection()])).join("");
-  if (!sections) return null;
+  const memorySection = async (): Promise<string> => {
+    if (cfg.maxResults <= 0) return "";
+    if (!cfg.resolveOn) return searchSection();
+    const room = cfg.maxChars - PREAMBLE.length;
+    if (room < RESOLVE_MIN_CHARS) return "";
+    const bundle = await resolveBundle(prompt, cfg, fetchFn, room);
+    if (bundle) return bundleIsEmpty(bundle) ? "" : `\n${bundle.text}\n`;
+    const fallback = await searchSection();
+    // Nothing recalled is nothing to mislead about: silence stays free, and
+    // the marker appears only where unresolved hits actually do.
+    // `fallback` already opens with its own newline, so the marker slots in
+    // ahead of a section that is otherwise byte-identical to today's.
+    return fallback ? `\n${RESOLUTION_DEADLINE_MARKER}${fallback}` : "";
+  };
 
-  const context = `## Palinode recall (this prompt)
+  const [triggers, memory] = await Promise.all([triggerSection(), memorySection()]);
+  if (!triggers && !memory) return null;
 
-Retrieved from persistent memory; may be stale — verify before relying on
-it. More detail: palinode_search / palinode_read.
-${sections}`;
-
-  return context.slice(0, cfg.maxChars);
+  // The memory section is already sized to fit (the server packed it against
+  // the room passed in `max_chars`), so the total is brought under the cap by
+  // trimming the trigger section — never by slicing the bundle, which is how
+  // a conflict the server kept whole would arrive with one side missing.
+  //
+  // The trigger trim cuts at a unit boundary and there is deliberately NO
+  // final `context.slice(0, cfg.maxChars)`: the only thing such a slice could
+  // still reach is the bundle, and when the bundle overruns it is because the
+  // server refused to buy room by dropping its own omitted-conflict notice.
+  // Slicing that off here would undo exactly the honesty it paid for.
+  const room = cfg.maxChars - PREAMBLE.length - memory.length;
+  return `${PREAMBLE}${room > 0 ? trimToUnitBoundary(triggers, room) : ""}${memory}`;
 }
 
 interface CoreListEntry {
@@ -270,6 +505,13 @@ interface CoreListEntry {
 /**
  * Session-start priming: warm server-side session context, then return a
  * bounded digest of `core: true` memories — or null when there are none.
+ *
+ * Deliberately NOT routed through bounded resolution (see the routing contract
+ * on `buildRecallContext`): a startup digest is orientation — "here is what
+ * this project keeps" — not an answer to a question, and there is no question
+ * yet to resolve. It keeps its own payload and its own budget (`coreMaxChars`,
+ * `timeoutMs`), so a per-turn deadline can never shrink the standing context a
+ * session opens with, and priming can never spend the per-turn budget.
  */
 export async function buildCoreDigest(
   cfg: PalinodeConfig,
@@ -305,7 +547,10 @@ files in this repo.
 Core memories:
 ${lines}`;
 
-  return context.slice(0, cfg.coreMaxChars);
+  // One row per line, so the cap lands between rows. A plain slice here could
+  // take a row's `⚠ contradicts:` qualifier off the end of the digest and
+  // leave a contested memory reading as standing context.
+  return trimToUnitBoundary(context, cfg.coreMaxChars);
 }
 
 /**
@@ -408,4 +653,83 @@ export async function postSessionCapture(
 ): Promise<boolean> {
   const res = await apiJson(cfg, fetchFn, "/session-end", { body: payload });
   return res !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Reversal client — the inverse of archival and retraction, over the REST
+// API. Plain fail-open calls: the result object on 2xx, null otherwise. Each
+// maps 1:1 to the registered operation in palinode/core/parity.py so a
+// binding exposing them inherits the canonical parameter names.
+// ---------------------------------------------------------------------------
+
+export interface RestoreResult {
+  file: string;
+  /** "active" when restored; "not_archived" when there was nothing to undo. */
+  status: string;
+  restored_from?: string | null;
+  restored_at?: string;
+  history_file?: string | null;
+  chunks_updated?: number;
+  /** Present when the memory still carries a TTL the sweep will act on. */
+  expires_at?: string;
+}
+
+/** Bring one archived memory back into default recall (inverse of /archive). */
+export async function restoreMemory(
+  filePath: string,
+  cfg: PalinodeConfig,
+  fetchFn: FetchFn = fetch,
+  reason?: string,
+): Promise<RestoreResult | null> {
+  const body: Record<string, unknown> = { file_path: filePath };
+  if (reason !== undefined) body.reason = reason;
+  const res = await apiJson(cfg, fetchFn, "/restore", { body });
+  return (res as RestoreResult | null) ?? null;
+}
+
+export interface UnretractResult {
+  file: string;
+  /** "unretracted", or "not_retracted" when the pref was not on record. */
+  status: string;
+  mentions: number;
+  retraction_id?: string;
+  history_file?: string | null;
+  index_error?: string;
+}
+
+/** Withdraw one pref's mention-level retraction from one memory. */
+export async function unretractMentions(
+  filePath: string,
+  pref: string,
+  cfg: PalinodeConfig,
+  fetchFn: FetchFn = fetch,
+  reason?: string,
+): Promise<UnretractResult | null> {
+  const body: Record<string, unknown> = { file_path: filePath, pref };
+  if (reason !== undefined) body.reason = reason;
+  const res = await apiJson(cfg, fetchFn, "/unretract", { body });
+  return (res as UnretractResult | null) ?? null;
+}
+
+export interface ForgetWithdrawResult {
+  file: string;
+  status: string;
+  pref: string;
+  restored: string[];
+  unretracted: Array<{ path: string; mentions: number }>;
+  requests_archived: string[];
+  failed?: Array<{ path: string; op: string }>;
+}
+
+/** Take a forget request back: restore + unretract its targets, archive the record. */
+export async function withdrawForgetRequest(
+  filePath: string,
+  cfg: PalinodeConfig,
+  fetchFn: FetchFn = fetch,
+  reason?: string,
+): Promise<ForgetWithdrawResult | null> {
+  const body: Record<string, unknown> = { file_path: filePath };
+  if (reason !== undefined) body.reason = reason;
+  const res = await apiJson(cfg, fetchFn, "/forget-withdraw", { body });
+  return (res as ForgetWithdrawResult | null) ?? null;
 }

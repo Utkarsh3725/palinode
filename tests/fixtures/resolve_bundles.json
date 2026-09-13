@@ -1,0 +1,320 @@
+{
+ "conflict": {
+  "budget": {
+   "chars": 716,
+   "items": 1,
+   "max_chars": 2000,
+   "max_items": 8,
+   "max_tokens": 750,
+   "tokens": 179
+  },
+  "conflicts": [
+   {
+    "reasons": [
+     "incomparable_observations"
+    ],
+    "seeds": [
+     "insights/region-b",
+     "insights/region-a"
+    ],
+    "sides": [
+     {
+      "currency": "current",
+      "currency_reason": "status:active",
+      "effective_at": "2026-09-03T00:00:00+00:00",
+      "epistemic": "fact",
+      "freshness": "valid",
+      "kind": "observation",
+      "qualifiers": [
+       "epistemic:fact"
+      ],
+      "ref": "insights/region-b",
+      "rel_path": "insights/region-b.md",
+      "revision": "f2f68e2478626817f46cd2f3d5cbd8651b374aa27979d455d638af78c93cf668",
+      "statement": "The cache cluster runs in region dublin.",
+      "title": "Region B"
+     },
+     {
+      "currency": "contested",
+      "currency_reason": "contradicts: insights/region-b",
+      "effective_at": "2026-09-02T00:00:00+00:00",
+      "epistemic": "fact",
+      "freshness": "valid",
+      "kind": "observation",
+      "qualifiers": [
+       "epistemic:fact",
+       "contradicts:insights/region-b"
+      ],
+      "ref": "insights/region-a",
+      "rel_path": "insights/region-a.md",
+      "revision": "2b1aa2d2d96e17e0e7aa1c08f25925d41f0fa66995b6757af7280b947b5b2537",
+      "statement": "The cache cluster runs in region frankfurt.",
+      "title": "Region A"
+     }
+    ]
+   }
+  ],
+  "coverage": {
+   "reasons": [],
+   "status": "complete"
+  },
+  "insufficient": [],
+  "intent": "current_state",
+  "omitted_conflict_refs": [],
+  "omitted_conflicts": 0,
+  "query": "cache cluster region",
+  "receipt": {
+   "bundle_id": "<bundle-id>",
+   "coverage": {
+    "reasons": [],
+    "status": "complete"
+   },
+   "dispositions": {
+    "conflict_side": 2,
+    "evidence_only": 0,
+    "insufficient": 0,
+    "replaced": 0,
+    "selected": 0
+   },
+   "evaluated_at": "<time>",
+   "lineage": [
+    {
+     "members": [
+      "insights/region-a"
+     ],
+     "origin": null,
+     "origin_kind": "unknown",
+     "origin_revision": null,
+     "status": "unknown"
+    },
+    {
+     "members": [
+      "insights/region-b"
+     ],
+     "origin": null,
+     "origin_kind": "unknown",
+     "origin_revision": null,
+     "status": "unknown"
+    }
+   ],
+   "next_transition": null,
+   "policy_version": "<policy>",
+   "requested_time": "<time>",
+   "scope": [],
+   "supplied": [
+    {
+     "currency": "current",
+     "disposition": "conflict_side",
+     "freshness": "valid",
+     "origin": null,
+     "origin_kind": "unknown",
+     "ref": "insights/region-b",
+     "revision": "f2f68e2478626817f46cd2f3d5cbd8651b374aa27979d455d638af78c93cf668",
+     "revision_basis": "index_section_sha256",
+     "span_integrity": null
+    },
+    {
+     "currency": "contested",
+     "disposition": "conflict_side",
+     "freshness": "valid",
+     "origin": null,
+     "origin_kind": "unknown",
+     "ref": "insights/region-a",
+     "revision": "2b1aa2d2d96e17e0e7aa1c08f25925d41f0fa66995b6757af7280b947b5b2537",
+     "revision_basis": "index_section_sha256",
+     "span_integrity": null
+    }
+   ]
+  },
+  "receipt_ref": "<bundle-id>",
+  "ref": null,
+  "replaced": [],
+  "selected": [],
+  "source_revisions": {
+   "insights/region-a": "2b1aa2d2d96e17e0e7aa1c08f25925d41f0fa66995b6757af7280b947b5b2537",
+   "insights/region-b": "f2f68e2478626817f46cd2f3d5cbd8651b374aa27979d455d638af78c93cf668"
+  },
+  "text": "### Resolved from memory (current state)\nQuestion: \"cache cluster region\"\n\nContested (1) \u2014 no winner; every visible side is shown:\n- [insights/region-b] Region B [current \u00b7 2026-09-03] The cache cluster runs in region dublin. [epistemic: fact]\n- [insights/region-a] Region A [contested \u00b7 2026-09-02] The cache cluster runs in region frankfurt. [\u26a0 contradicts: insights/region-b | epistemic: fact]\n    reasons: incomparable_observations\n\nCoverage: complete\nReceipt: <bundle-id>"
+ },
+ "current": {
+  "budget": {
+   "chars": 452,
+   "items": 1,
+   "max_chars": 2000,
+   "max_items": 8,
+   "max_tokens": 750,
+   "tokens": 114
+  },
+  "conflicts": [],
+  "coverage": {
+   "reasons": [],
+   "status": "complete"
+  },
+  "insufficient": [],
+  "intent": "current_state",
+  "omitted_conflict_refs": [],
+  "omitted_conflicts": 0,
+  "query": "endpoint production traffic",
+  "receipt": {
+   "bundle_id": "<bundle-id>",
+   "coverage": {
+    "reasons": [],
+    "status": "complete"
+   },
+   "dispositions": {
+    "conflict_side": 0,
+    "evidence_only": 0,
+    "insufficient": 0,
+    "replaced": 0,
+    "selected": 1
+   },
+   "evaluated_at": "<time>",
+   "lineage": [
+    {
+     "members": [
+      "decisions/endpoint-v2"
+     ],
+     "origin": null,
+     "origin_kind": "unknown",
+     "origin_revision": null,
+     "status": "unknown"
+    }
+   ],
+   "next_transition": null,
+   "policy_version": "<policy>",
+   "requested_time": "<time>",
+   "scope": [],
+   "supplied": [
+    {
+     "currency": "current",
+     "disposition": "selected",
+     "freshness": "valid",
+     "origin": null,
+     "origin_kind": "unknown",
+     "ref": "decisions/endpoint-v2",
+     "revision": "1a0761faed7aa31666d135ba74b1838db13f4e3c8bf6d265ad787cc07fc76037",
+     "revision_basis": "index_section_sha256",
+     "span_integrity": null
+    }
+   ]
+  },
+  "receipt_ref": "<bundle-id>",
+  "ref": null,
+  "replaced": [],
+  "selected": [
+   {
+    "alternatives": [],
+    "currency": "current",
+    "currency_reason": "status:active",
+    "effective_at": "2026-09-01T00:00:00+00:00",
+    "epistemic": "fact",
+    "freshness": "valid",
+    "kind": "accepted_intent",
+    "qualifiers": [
+     "epistemic:fact"
+    ],
+    "reasons": [
+     "uncontested"
+    ],
+    "ref": "decisions/endpoint-v2",
+    "refs": {
+     "replaces": [],
+     "seeds": [
+      "decisions/endpoint-v2"
+     ],
+     "support": []
+    },
+    "rel_path": "decisions/endpoint-v2.md",
+    "revision": "1a0761faed7aa31666d135ba74b1838db13f4e3c8bf6d265ad787cc07fc76037",
+    "statement": "Production serves traffic from endpoint bravo.",
+    "title": "Endpoint v2"
+   }
+  ],
+  "source_revisions": {
+   "decisions/endpoint-v2": "1a0761faed7aa31666d135ba74b1838db13f4e3c8bf6d265ad787cc07fc76037"
+  },
+  "text": "### Resolved from memory (current state)\nQuestion: \"endpoint production traffic\"\n\nCurrent (1):\n- [decisions/endpoint-v2] Endpoint v2 [current \u00b7 2026-09-01] Production serves traffic from endpoint bravo.\n    qualifiers: epistemic:fact\n    why: uncontested\n    revision: 1a0761faed7a\n\nCoverage: complete\nReceipt: <bundle-id>"
+ },
+ "unknown": {
+  "budget": {
+   "chars": 351,
+   "items": 1,
+   "max_chars": 2000,
+   "max_items": 8,
+   "max_tokens": 750,
+   "tokens": 89
+  },
+  "conflicts": [],
+  "coverage": {
+   "reasons": [],
+   "status": "complete"
+  },
+  "insufficient": [
+   {
+    "reasons": [
+     "kind_unknown",
+     "lineage_unknown",
+     "support_withdrawn"
+    ],
+    "ref": "insights/throughput",
+    "rel_path": "insights/throughput.md",
+    "title": "Throughput"
+   }
+  ],
+  "intent": "current_state",
+  "omitted_conflict_refs": [],
+  "omitted_conflicts": 0,
+  "query": "pipeline throughput ceiling",
+  "receipt": {
+   "bundle_id": "<bundle-id>",
+   "coverage": {
+    "reasons": [],
+    "status": "complete"
+   },
+   "dispositions": {
+    "conflict_side": 0,
+    "evidence_only": 0,
+    "insufficient": 1,
+    "replaced": 0,
+    "selected": 0
+   },
+   "evaluated_at": "<time>",
+   "lineage": [
+    {
+     "members": [
+      "insights/throughput"
+     ],
+     "origin": "research/vendor-quote",
+     "origin_kind": "backed_by",
+     "origin_revision": null,
+     "status": "known"
+    }
+   ],
+   "next_transition": null,
+   "policy_version": "<policy>",
+   "requested_time": "<time>",
+   "scope": [],
+   "supplied": [
+    {
+     "currency": "current",
+     "disposition": "insufficient",
+     "freshness": "valid",
+     "origin": "research/vendor-quote",
+     "origin_kind": "backed_by",
+     "ref": "insights/throughput",
+     "revision": "96a8e1b695b4aaf52fdf60ded83de254d73486df43aec6dd2f49860170fa68d9",
+     "revision_basis": "index_section_sha256",
+     "span_integrity": null
+    }
+   ]
+  },
+  "receipt_ref": "<bundle-id>",
+  "ref": null,
+  "replaced": [],
+  "selected": [],
+  "source_revisions": {
+   "insights/throughput": "96a8e1b695b4aaf52fdf60ded83de254d73486df43aec6dd2f49860170fa68d9"
+  },
+  "text": "### Resolved from memory (current state)\nQuestion: \"pipeline throughput ceiling\"\n\nUnknown (1):\n- [insights/throughput] Throughput \u2014 kind_unknown, lineage_unknown, support_withdrawn\n\nCoverage: complete\nReceipt: <bundle-id>"
+ }
+}

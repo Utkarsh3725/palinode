@@ -2,8 +2,10 @@
 
 These are regression guards for two things:
 
-1. The deterministic slash commands (`/ps` and `/wrap`). If someone refactors
-   `init.py` and accidentally reintroduces smart-dispatch, these tests fail.
+1. The deterministic `/wrap` slash command — the sole lifecycle command
+   (`/save` and `/ps` are deprecated and no longer scaffolded; the guards
+   below assert they stay absent). If someone refactors `init.py` and
+   accidentally reintroduces smart-dispatch, these tests fail.
 2. The idempotent install flow — re-running init must not corrupt existing
    files, and merging into existing JSON must not stomp unrelated keys.
 """

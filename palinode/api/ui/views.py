@@ -19,10 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from palinode.core.skip_dirs import is_skipped_path
+
 # Passed to collect_memory_files(skip_dirs=...): the same non-browsable dirs
-# ``list_api`` skips, plus ``.obsidian`` (UI-only), so the UI list matches the
-# canonical "memories a human browses" definition.
-_LIST_SKIP_DIRS = frozenset({"daily", "archive", "inbox", "logs", "prompts", ".obsidian"})
+# ``list_api`` skips, on top of the never-memory dirs every surface skips
+# (``palinode.core.skip_dirs.ALWAYS_SKIP`` — which is where ``.obsidian``,
+# ``logs`` and the store's own ``specs/prompts`` copies live), so the UI list
+# matches the canonical "memories a human browses" definition.
+_LIST_SKIP_DIRS = frozenset({"daily", "archive", "inbox"})
 
 # Freshness buckets (days since last_updated). "stale" mirrors lint's 90-day
 # threshold so the memory-list freshness filter and the quality view agree.
@@ -38,15 +42,17 @@ def is_browsable_memory(rel_path: str) -> bool:
     this so they can't disagree (the bug where the sidebar badge showed 3 while
     the list showed 2 because lint counted a ``-history.md`` sibling the scan
     excluded). A path is browsable when it is a ``.md`` file, not under a
-    skip-dir (``daily``/``archive``/``inbox``/``logs``/``prompts``/``.obsidian``),
-    and not a ``-history.md`` consolidation sibling (those belong to the
-    compaction view, not the memory list).
+    skip-dir at ANY depth (``daily``/``archive``/``inbox`` plus
+    :data:`palinode.core.skip_dirs.ALWAYS_SKIP`, which is what keeps the
+    store's own ``specs/prompts/*.md`` off the browse surface), and not a
+    ``-history.md`` consolidation sibling (those belong to the compaction
+    view, not the memory list).
     """
     rel = rel_path.replace(os.sep, "/").lstrip("/")
     if not rel.endswith(".md"):
         return False
     parts = rel.split("/")
-    if parts[0] in _LIST_SKIP_DIRS:
+    if is_skipped_path(rel, _LIST_SKIP_DIRS):
         return False
     if parts[-1].endswith("-history.md"):
         return False
@@ -224,6 +230,14 @@ def run_search(
                 "type": meta.get("type"),
                 "snippet": r.get("snippet") or "",
                 "score": round(float(r.get("score", 0.0)), 3),
+                # Search's `freshness` is index/source agreement (stored hash
+                # vs the file) — a different question from the memory list's
+                # age-based fresh/aging/stale, so it is carried under its own
+                # name and rendered as such. `currency` is whether the
+                # assertion is still in force (lifecycle + tombstone text).
+                "index_agreement": r.get("freshness"),
+                "currency": r.get("currency"),
+                "currency_reason": r.get("currency_reason"),
             }
         )
     return {"query": q, "results": results, "count": len(results), "error": None}
@@ -362,6 +376,19 @@ def build_quality_view(lint: dict[str, Any]) -> dict[str, Any]:
     # missing-extraction-metadata is keyed off the same scanned file set the
     # lint counts use (passed in by the router as ``no_extraction_meta``).
     no_extraction = _files(lint.get("no_extraction_meta", []))
+    # stale backing: the dependent side of `backed_by` propagation — the
+    # detail names which source was retired and how.
+    stale_backing = _files(lint.get("stale_backing", []))
+    _sb_detail = {
+        it.get("file"): ", ".join(
+            f"{e.get('ref')} ({e.get('op')})" for e in it.get("stale_backing", [])
+        )
+        for it in lint.get("stale_backing", [])
+        if isinstance(it, dict)
+    }
+    for row in stale_backing:
+        if _sb_detail.get(row["path"]):
+            row["detail"] = f"backed by {_sb_detail[row['path']]}"
 
     queues = [
         {
@@ -397,6 +424,13 @@ def build_quality_view(lint: dict[str, Any]) -> dict[str, Any]:
             "label": "No extraction metadata",
             "blurb": "extraction provenance not yet captured (G2)",
             "rows": no_extraction,
+            "kind": "files",
+        },
+        {
+            "key": "stale_backing",
+            "label": "Stale backing",
+            "blurb": "a backed_by source was superseded, retracted, archived or merged — re-verify",
+            "rows": stale_backing,
             "kind": "files",
         },
     ]

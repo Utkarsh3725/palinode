@@ -27,6 +27,13 @@ _logger = logging.getLogger("palinode.config")
 ToolSurface = Literal["core", "full"]
 VALID_TOOL_SURFACES: set[str] = {"core", "full"}
 
+# Wire dialects the embed client can speak. "ollama" is the native
+# /api/embed (+ legacy /api/embeddings) pair; "openai" is the OpenAI-compatible
+# /v1/embeddings shape served by llama.cpp (`llama-server --embedding`), vLLM,
+# and LM Studio. Validated at load time so a typo fails loud instead of
+# silently falling back to the Ollama wire format.
+VALID_EMBEDDING_DIALECTS: set[str] = {"ollama", "openai"}
+
 
 def validate_tool_surface(value: str, source: str = "tool_surface") -> ToolSurface:
     normalized = value.strip().lower()
@@ -88,6 +95,33 @@ class PrimaryEmbeddingConfig:
     dimensions: int = 1024
     timeout_seconds: int = 120
     connect_timeout_seconds: int = 10
+    # Wire protocol at `url`. "ollama" (default; back-compat) = native
+    # /api/embed with the /api/embeddings fallback. "openai" = POST
+    # {model, input} to /v1/embeddings (llama.cpp, vLLM, LM Studio) — set this
+    # when the embedding host is not Ollama. Same retry/backoff, circuit
+    # breaker, and typed per-input errors either way. Mirrors the CHAT role's
+    # `auto_summary.api` selector; no auto-detection.
+    dialect: str = "ollama"
+    # Ollama's GPU path for GGUF bge-m3 returns a NaN vector for a small set of
+    # exact inputs (llama.cpp casts K/V to F16 before flash attention on
+    # cacheless encoders; Inf → NaN in softmax; the server refuses to serialise
+    # it, HTTP 500). The same input embeds correctly on the CPU path. When set,
+    # a NaN-shaped rejection is retried once with ``options.num_gpu: 0`` and
+    # ``keep_alive: 0`` — the second is load-bearing: under a long server-side
+    # keep_alive a CPU request would leave the model CPU-resident for every
+    # later caller (seen on the shared host, 2026-09-08). Ollama dialect only.
+    # Cost: one CPU load + embed + unload per rare input. Off → the chunk stays
+    # FTS-only until re-embedded, as before.
+    nan_cpu_retry: bool = True
+
+    def __post_init__(self) -> None:
+        normalized = self.dialect.strip().lower()
+        if normalized not in VALID_EMBEDDING_DIALECTS:
+            raise ValueError(
+                "embeddings.primary.dialect must be one of "
+                f"{sorted(VALID_EMBEDDING_DIALECTS)}, got {self.dialect!r}"
+            )
+        self.dialect = normalized
 
 @dataclass
 class EmbeddingsConfig:
@@ -133,15 +167,47 @@ class AutoSummaryConfig:
     llm_fallback_max_per_run: int = 10
 
 @dataclass
+class EvidenceConfig:
+    """Budgets for the opt-in evidence resolver behind ``search --resolve``.
+
+    Each is a hard, deterministic ceiling on one kind of work the resolver
+    may do for one request (``palinode.core.evidence``). Link traversal
+    (``max_files`` / ``max_edges`` / ``max_depth``), replacement-chain walks
+    (``max_replacement_chain``) and unlinked discovery (``fallback_*``) are
+    budgeted separately so exhausting one never silently starves another,
+    and every exhausted budget is named in the result's ``coverage``.
+    Conservative on purpose: the resolver runs inside a search request.
+    """
+    #: Distinct files read from disk beyond the seeds (link traversal).
+    max_files: int = 24
+    #: Typed-link edges followed (forward and reverse, all seeds together).
+    max_edges: int = 48
+    #: Hops of ``contradicts`` / ``backed_by`` from a seed.
+    max_depth: int = 2
+    #: Hops along a ``superseded_by`` chain from any node, kept apart from
+    #: ``max_depth`` so a long replacement lineage cannot eat the edge budget.
+    max_replacement_chain: int = 8
+    #: Retrieval calls unlinked discovery may make (entity, keyword, neighbour
+    #: lookups count one each), spent in seed rank order.
+    fallback_max_queries: int = 18
+    #: Files unlinked discovery may read beyond the linked ones.
+    fallback_max_reads: int = 12
+    #: Hops of ``backed_by`` the read-time support check walks from a record
+    #: (1 = its own sources, 2 = its sources' sources). Separate from
+    #: ``max_depth`` so a spent traversal budget cannot silence the second-hop
+    #: check; its file reads are still charged against ``max_files``.
+    max_support_hops: int = 2
+
+@dataclass
 class SearchConfig:
     """Matching index score cutoffs thresholds layouts.
 
     mcp_threshold / api_threshold moved from a post-RRF-fusion cutoff (a rank
-    artifact, see ranker.rank_hybrid) to a PER-ARM relevance floor — real
-    cosine similarity for the vector arm, normalized BM25 for the FTS arm,
-    applied before fusion. That changed what these two numbers mean, so both
-    were re-measured against real bge-m3 embeddings + real SQLite FTS5 (no
-    synthetic vectors), not carried over from the pre-fix values by default.
+    artifact, see ranker.rank_hybrid) to a pre-fusion vector relevance floor
+    measured as real cosine similarity. That changed what these two numbers
+    mean, so both were re-measured against real bge-m3 embeddings + real
+    SQLite FTS5 (no synthetic vectors), not carried over from the pre-fix
+    values by default. BM25 uses the independent ``fts_threshold`` below.
     Methodology (54 query/chunk pairs, three rounds, deliberately spanning
     the relevance range rather than stacking near-duplicates at cosine>=0.9):
     round 1 (n=30) full-sentence questions a user/agent would naturally ask;
@@ -169,22 +235,35 @@ class SearchConfig:
 
     Known, measured, NOT fixed here: BM25-normalized and cosine are not on a
     comparable scale, so one shared threshold value is itself imprecise.
-    FTS retrieved a candidate at all in only 17/54 pairs (0/30 for
-    full-sentence queries — sanitize_fts_query's boolean-operator stripping
-    plus FTS5's implicit-AND-across-all-terms means an ordinary question
-    essentially never token-matches its target) and its own normalized score
-    for a genuine hit skewed low even where BM25 should be doing the real
-    work: single-identifier queries in round 3 scored 0.131-0.352, all below
-    even mcp_threshold. In every round measured, whenever FTS DID retrieve
-    the true match, the vector arm ALSO scored it >=0.5 — so at either
-    current value, BM25's independent-rescue role is close to vestigial for
-    the query shapes tested. A structurally correct fix (separate per-arm
-    thresholds, or recalibrating search_fts's raw-score/25.0 normalization)
-    is a bigger change than adjusting these two numbers and is intentionally
-    not made here.
+    When these bands were measured, FTS retrieved a candidate at all in only
+    17/54 pairs (0/30 for full-sentence queries — FTS5's implicit AND across
+    every token meant an ordinary question never matched its target); that
+    half is fixed by ``store.fts_match_expression`` (OR-joined
+    content words, identifier phrases), measured at +5.8 on exact-label
+    questions. What remains: the arm's normalized score for a genuine hit
+    skews low even where BM25 should do the real work — single-identifier
+    queries in round 3 scored 0.131-0.352, all below even mcp_threshold. A
+    structurally correct fix (separate per-arm thresholds, or recalibrating
+    search_fts's raw-score/25.0 normalization) is a bigger change than
+    adjusting these two numbers and is intentionally not made here.
     """
     mcp_threshold: float = 0.4
     api_threshold: float = 0.5
+    # The FTS arm's own floor, RELATIVE to the best keyword match in the same
+    # result set: an FTS candidate survives when ``score >= fts_threshold *
+    # top_score``. ``threshold`` (mcp_/api_) is an absolute cosine floor; the
+    # FTS arm's normalized BM25 (``|bm25| / 25``) is on a different scale AND
+    # that scale moves with corpus size (IDF ~ log N/df), so an absolute floor
+    # is wrong twice — at 0.4/0.5 it discarded most correct keyword hits before
+    # fusion, and any absolute value right for a 30-chunk store is wrong for a
+    # 4-chunk one. Measured 2026-09-08 on the 54-pair rig after the OR-join
+    # fix: the true chunk is the top keyword match in 51/54 pairs and within
+    # 0.49–0.92× of it in the other three; the best distractor sits at a
+    # median 0.39× of the top. 0.4 keeps every true hit in that set and drops
+    # about half the distractors; rank fusion and top_k do the rest. The
+    # normalization itself is still the structurally wrong scale — this is the
+    # per-arm floor from the original finding, not the rescale.
+    fts_threshold: float = 0.4
     # The BEAM k-sweep (400 answers/point, replicated on a second judge family)
     # measured contradiction_resolution rising
     # 0.300→0.388→0.456 at k=5/10/15 then plateauing to k=25 (0.416, n.s. step).
@@ -216,13 +295,34 @@ class SearchConfig:
     # MCP renders snippet by default; full chunk content remains available
     # through `content` (API/CLI) or the `full=true` flag on palinode_search.
     snippet_max_chars: int = 400
+    # Budgets for the opt-in evidence resolver (``resolve`` on search).
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
+
+@dataclass
+class ReadConfig:
+    """Caps for the tiered read views.
+
+    Tiers are computed at read time from content already in hand — these are
+    presentation caps, not storage limits. Nothing here changes what is on
+    disk or in the index.
+    """
+    #: ``tier=abstract`` — summary / canonical_question / first paragraph.
+    abstract_max_chars: int = 300
+    #: ``tier=overview`` — frontmatter block plus the head of the body.
+    overview_max_chars: int = 4000
 
 @dataclass
 class NightlyConfig:
     """Lightweight daily update configurations."""
     enabled: bool = True
     lookback_days: int = 1
-    allowed_ops: list[str] = field(default_factory=lambda: ["UPDATE", "SUPERSEDE", "MERGE"])
+    # PROPOSE_CONTRADICTS is in the default set because it is the
+    # no-winner counterpart to SUPERSEDE: it records a conflict in
+    # frontmatter and retires nothing, so it is additive in exactly the
+    # sense this restricted pass requires. Omitting it would filter out
+    # every proposal the nightly prompt now asks for.
+    allowed_ops: list[str] = field(default_factory=lambda:
+        ["UPDATE", "SUPERSEDE", "MERGE", "PROPOSE_CONTRADICTS"])
 
 @dataclass
 class WriteTimeConfig:
@@ -280,6 +380,37 @@ class ForgetConfig:
     min_target_coverage: float = 0.05
 
 @dataclass
+class AutoGateConfig:
+    """Activity gate for the automatic (cron) consolidation path.
+
+    The wall-clock schedule alone gets both cases wrong: an idle week still
+    burns an LLM pass, and a heavy day still waits for the next tick. An
+    automatic pass runs only when **both** conditions hold — at least
+    ``min_hours_elapsed`` since that pass last ran, and at least
+    ``min_sessions`` session-end entries recorded since then — so the cron can
+    fire as often as you like and the pass lands on use rather than on the
+    calendar. The elapsed floor carries one hour of slack and is measured from
+    the previous pass's *start*, so a daily cron satisfies the 24 h default
+    despite tick jitter and however long the pass itself took; the ceiling has
+    no slack.
+
+    ``max_hours_elapsed`` is the ceiling that defeats the gate: past it the
+    pass runs whatever the session count is. Without it, a store that ingests
+    through the watcher and records no sessions would never consolidate — the
+    dual gate turns "no sessions" into "never", which is worse than the wasted
+    pass it exists to prevent. The default equals the weekly cadence
+    consolidation already had, so an idle deployment keeps today's behaviour.
+
+    Enabled by default, and only on the automatic path: ``palinode
+    consolidate`` / ``dream``, ``POST /consolidate`` and the MCP tool bypass
+    the gate unless they ask for it (``--respect-gate`` / ``respect_gate``).
+    """
+    enabled: bool = True
+    min_hours_elapsed: float = 24
+    min_sessions: int = 5
+    max_hours_elapsed: float = 168
+
+@dataclass
 class ConsolidationConfig:
     """Interval LLM job configuration settings logic."""
     enabled: bool = True
@@ -298,8 +429,10 @@ class ConsolidationConfig:
     # third, unrelated `compaction.allowed_ops` key that looked like it did
     # this and did nothing — removed; this is now the only weekly-pass knob.
     allowed_ops: list[str] = field(default_factory=lambda:
-        ["KEEP", "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT"])
+        ["KEEP", "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT",
+         "PROPOSE_CONTRADICTS", "ARCHIVE_BEFORE"])
     nightly: NightlyConfig = field(default_factory=NightlyConfig)
+    auto_gate: AutoGateConfig = field(default_factory=AutoGateConfig)
     write_time: WriteTimeConfig = field(default_factory=WriteTimeConfig)
     forget: ForgetConfig = field(default_factory=ForgetConfig)
     keyword_map: dict[str, list[str]] | None = None
@@ -307,6 +440,19 @@ class ConsolidationConfig:
     # older blocks collapse into one cumulative elision line (the full detail
     # stays in git history). 0 disables the cap.
     status_log_max_blocks: int = 10
+    # How long a dated `- [YYYY-MM-DD] …` status log line stays in the document
+    # before the weekly pass retires it to `-history.md` — deterministically,
+    # with no model involved. One line per session accumulates faster than any
+    # proposal can retire it: at 449 facts the honest ARCHIVE-per-fact proposal
+    # overflowed every workable token cap, so nothing was ever retired.
+    # 90 days is a quarter: long enough that a line is still in the window
+    # while anyone might reasonably recall the session that wrote it, and
+    # more than twelve times the weekly pass's own 7-day lookback, so a line
+    # has been seen by a dozen passes before age alone retires it. Nothing is
+    # lost — the sibling `-history.md` keeps every retired line verbatim.
+    # 0 disables the sweep entirely. Only applied to age-eligible documents
+    # (ADR-020): an identity/profile document is never retired by age.
+    status_log_retention_days: int = 90
 
 @dataclass
 class DecayConfig:
@@ -399,6 +545,18 @@ instrumentation).
     capture_retrievals: bool = True
 
 @dataclass
+class WriteConfig:
+    """What the capture surfaces normalize on the way in.
+
+    ``normalize_relative_dates`` defaults ON because ``PROGRAM.md`` already
+    requires it of every extractor: a relative time expression is resolved
+    against the session date and stored absolute, because nothing downstream
+    can recover which Tuesday "last Tuesday" was. Turning it off keeps the
+    author's wording and leaves the drift for ``palinode lint`` to report.
+    """
+    normalize_relative_dates: bool = True
+
+@dataclass
 class LoggingConfig:
     """Log formatting and target directories constraints formats."""
     operations_log: str = "logs/operations.jsonl"
@@ -438,12 +596,49 @@ class LayerSplitConfig:
 
 @dataclass
 class ContextConfig:
-    """Ambient context for search boosting. Resolves caller's project from CWD."""
+    """Ambient context for search boosting. Resolves caller's project from CWD.
+
+    Also carries the **injection budgets** — the ceilings on what Palinode puts
+    into a context window without being asked. The two surfaces are budgeted
+    separately because they are paid differently: the startup payload is paid
+    once per session and can afford orientation; the per-turn recall block is
+    paid on every message and competes with the user's own turn.
+
+    Both are expressed twice, in characters and in estimated tokens
+    (``packing.estimate_tokens``, chars/4 — an estimate, not a tokenizer).
+    Under that estimator the pairs below are two views of one ceiling; they
+    diverge only if a real tokenizer ever replaces the estimate, which is why
+    both are enforced. ``0`` disables a cap; ``0`` on both members of a pair
+    leaves that surface bounded only by its own line/count limits
+    (``context_prime.MAX_*``), which is exactly the pre-budget behaviour.
+
+    Defaults. ``injection_max_chars = 6000`` (~1500 estimated tokens) is a
+    little above what today's bounds can produce — 23 rows capped at
+    ``MAX_LINE_CHARS`` plus headings — so a normal digest is unaffected and an
+    accreting core set is caught instead of quietly crowding the window.
+    ``recall_max_chars = 3000`` (~750 tokens) matches the per-turn ceiling the
+    shipped harness plugin already applies (``PALINODE_HOOK_RECALL_MAX_CHARS``),
+    so the server-side budget agrees with the client-side one rather than
+    fighting it.
+    """
     enabled: bool = True
     boost: float = 1.5              # Multiplier for context-matching results (1.0 = disabled)
     auto_detect: bool = True        # Fall back to project/{basename(cwd)} if not in project_map
     project_map: dict[str, str] = field(default_factory=dict)  # CWD basename → entity ref
     embed_augment: bool = True      # Prepend project context to query before embedding
+    #: Session-start core injection: /context/prime, palinode_session_init,
+    #: palinode prime.
+    injection_max_chars: int = 6000
+    injection_max_tokens: int = 1500
+    #: Per-turn recall block (the harness recall hook's payload).
+    recall_max_chars: int = 3000
+    recall_max_tokens: int = 750
+    #: A `core: true` memory is an index entry — a gist and a pointer to the
+    #: file that holds the detail. Above this size it is a document wearing a
+    #: core flag, and `palinode lint` says so. 1500 chars (~375 estimated
+    #: tokens, roughly a screenful) keeps the whole core set readable in a few
+    #: thousand tokens even when every pointer is followed.
+    core_gist_max_chars: int = 1500
 
 @dataclass
 class AutoInjectConfig:
@@ -550,6 +745,7 @@ class Config:
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     auto_summary: AutoSummaryConfig = field(default_factory=AutoSummaryConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
+    read: ReadConfig = field(default_factory=ReadConfig)
     consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     ku_compat: KUCompatConfig = field(default_factory=KUCompatConfig)
@@ -558,6 +754,7 @@ class Config:
     scope: ScopeConfig = field(default_factory=ScopeConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
+    write: WriteConfig = field(default_factory=WriteConfig)
     git: GitConfig = field(default_factory=GitConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     instrumentation: InstrumentationConfig = field(default_factory=InstrumentationConfig)

@@ -40,7 +40,7 @@ palinode doctor --fix --dry-run  # 3. preview safe fixes if any apply
 
 ## The check catalog
 
-There are 22 checks across six categories. Severity is one of `info`, `warn`, `error`, `critical`; `passed=True` means the check did not detect a problem (a passed `info` check still appears in the report so the operator can see the resolved state).
+There are 23 checks across six categories. Severity is one of `info`, `warn`, `error`, `critical`; `passed=True` means the check did not detect a problem (a passed `info` check still appears in the report so the operator can see the resolved state).
 
 ### Path integrity
 
@@ -121,7 +121,7 @@ Fix is by restart, not by data motion: `systemctl --user restart palinode-api`. 
 
 #### `watcher_alive`
 
-On Linux, prefers `systemctl --user is-active palinode-watcher.service` and falls back to scanning `ps -ef` for a process whose command line contains `palinode.indexer.watcher`. On macOS, only the `ps` scan is available because Palinode does not currently ship a launchd unit.
+On Linux, probes `systemctl is-active` on the **system** manager first and `systemctl --user is-active` second, accepting either shipped unit name — `palinode-watcher.service` (the `deploy/systemd/` default) or `palinode-indexer.service` (the installer's `WATCHER_UNIT_NAME` override, which the check also honours when it is exported) — and names the manager and unit that answered. It falls back to scanning `ps -ef` for a process whose command line contains `palinode.indexer.watcher`, and only suggests installing a unit when no unit is active under either manager. On macOS, only the `ps` scan is available because Palinode does not currently ship a launchd unit.
 
 #### `watcher_indexes_correct_db`
 
@@ -140,6 +140,8 @@ Config-vs-runtime consistency checks. All `fast` (no network).
 | `env_vs_yaml_consistency` | warn | An env var is overriding a non-default YAML value |
 | `mcp_config_homes` | warn | Multiple MCP client config files have divergent `palinode` entries |
 | `process_env_drift` | warn / info | A running palinode-{api,mcp,watcher} has stale `PALINODE_DIR` |
+| `prompts_current` | warn / info | The store's consolidation prompts lag the ones shipped with this release |
+| `consolidation_targets_tagged` | warn / info | A consolidation target document carries body bullets but no `<!-- fact:id -->` markers, so every pass over it proposes nothing |
 
 #### `env_vs_yaml_consistency`
 
@@ -167,6 +169,35 @@ For every running palinode-{api,mcp,watcher}, reads `/proc/<pid>/environ` (Linux
 
 When the API runs the check on itself (`GET /doctor` from inside the API process), it skips its own PID — the API's environ is necessarily what the API sees, so the comparison is meaningless.
 
+#### `prompts_current`
+
+Consolidation prefers the prompts in the **memory store** (`$PALINODE_DIR/specs/prompts/*.md`) over the packaged ones, because they are yours to edit. A store keeps whatever prompt files it was provisioned with, so a release that changes a prompt changes nothing on a store that predates it: the new behaviour ships, and is reachable only where somebody refreshed the files. Nothing else in doctor looks at that.
+
+The check compares the `version:` frontmatter of every packaged prompt against the store's copy of the same filename.
+
+"Packaged" means the prompts inside the install (`palinode/prompts/`), so the check works the same on a `pip install` as in a checkout.
+
+- Warn: a store copy declares an older `version:` than the packaged one ("lags"), declares a different one ("differs from" — a locally bumped or hand-edited prompt), declares none where the packaged one does, or is absent from the store entirely. The message names each file with both versions; the remediation is [`palinode prompt sync`](CLI.md#palinode-prompt-sync), which replaces only the copies you have not edited and reports the rest.
+- Info: every versioned prompt matches. The message also states how many packaged prompts declare no `version:` — those cannot be compared, and are reported as uncovered rather than counted as current.
+- Info: the store has no `specs/prompts/` at all (a fresh or prompt-less store). The message names the missing path. Consolidation still runs — the runner falls back to the packaged copies — but nothing there is yours to edit until `palinode init` or `palinode prompt sync` provisions it.
+- Info: this install has no packaged prompts at all. Only reachable on a damaged install; reinstall palinode. The message names the path it looked for.
+
+Tagged `fast`: a bounded read of a handful of small files, no network.
+
+#### `consolidation_targets_tagged`
+
+Consolidation addresses facts by id: the runner harvests only the bullets carrying `<!-- fact:id -->`, and the executor's operations name those ids. A target document whose bullets have no markers is therefore *inert* — the pass collects its daily notes, finds nothing it can address, proposes nothing, and reports `status: success`. On one real store that ran 79 consecutive nightly times against a 449-bullet status document appended entirely by session-end, which never minted markers.
+
+The check reads every `projects/*-status.md`, plus the target of any project a recent daily note mentions (which catches a plain `projects/<slug>.md` target the glob misses), and compares body bullets against markers. Frontmatter is excluded on both counts — a `- project/foo` under `entities:` is YAML, not a fact.
+
+- Warn: a target has body bullets and zero markers. The message names each file with its untagged-bullet count; the remediation is a ready-to-run [`palinode bootstrap-ids --file <path>`](CLI.md#palinode-bootstrap-ids) per file (idempotent, committed with provenance).
+- Info: every target either carries markers or has no body bullets yet. One marker is enough — a partially tagged document is normal, since consolidation tags what it rewrites.
+- Info: the store has no `projects/` directory, or no target documents in it.
+
+Session-end mints an id on each line it appends, so this fires on stores that predate that fix and on documents built by hand or by an importer that does not mint — not on ongoing use.
+
+Tagged `fast`: one directory glob plus a bounded read of the recent daily notes, no network.
+
 ### Index sanity
 
 | Check | Severity | Catches |
@@ -174,6 +205,7 @@ When the API runs the check on itself (`GET /doctor` from inside the API process
 | `chunks_match_md_count` | warn (error if ratio < 0.5) | Partial reindex, fresh empty DB, or watcher stopped early |
 | `db_size_sanity` | warn | DB has shrunk by >50% since last doctor run (the phantom-empty-DB signature) |
 | `reindex_in_progress` | info / warn | A reindex is currently running (or appears stuck) |
+| `projection_current` | warn | Indexed chunks still derived under an older current-text projection (or none) — retired facts can still rank |
 
 #### `chunks_match_md_count`
 
@@ -199,12 +231,22 @@ Queries the API's `/status` endpoint and reports whether a reindex is running. S
 
 This check is also load-bearing as context for `chunks_match_md_count`: a low chunk count during an active reindex is normal, not a fault.
 
+#### `projection_current`
+
+The indexer derives each chunk's search text through a versioned current-text projection that removes the consolidation executor's retirement tombstones (`~~old~~ [superseded …]` / `[RETRACTED …]`) before FTS5 and the embedder see it, and stamps the row with the `PROJECTION_VERSION` it used. This check opens the DB read-only and counts chunks whose stamp is missing or older. Tagged `fast`.
+
+- Pass: every indexed chunk is on the current projection version (or the store is empty / not yet initialised). The count is reported.
+- Warn: some chunks are behind — a store indexed before the projection existed, or before a rules change. Those chunks still carry retired wording in the keyword and vector index, so an old assertion can rank beside its successor. Reconcile re-derives them as their files are visited (a save, the watcher, `palinode reindex`), so the number is migration progress; a chunk whose stored text already equals its projection is stamped in place without re-embedding. A schema without the column at all (the API has not started since the upgrade) reports every chunk behind.
+
+Remediation: `palinode reindex` finishes the migration in one pass. If the embedder is cold, rows are re-derived keyword-searchable first and re-embedded on the next warm pass — the same deferral the save path reports.
+
 ### Disk and backup
 
 | Check | Severity | Catches |
 |---|---|---|
 | `git_commit_ready` | warn | `git.auto_commit` is on but `memory_dir` is not a git repo, or no commit identity resolves there — every save reports `git_committed: false` |
 | `git_remote_health` | warn | Memory store has no offsite backup, or unpushed drift > 50 commits |
+| `store_tree_clean` | warn | More than 10 modified or untracked files in `memory_dir` — a writer is skipping its commit |
 | `audit_log_writable` | warn | `audit.log_path` is relative (logs scatter across cwds) or unwritable |
 
 #### `git_commit_ready`
@@ -212,7 +254,7 @@ This check is also load-bearing as context for `chunks_match_md_count`: a low ch
 Read-only probe of the auto-commit precondition: `git -C ${memory_dir} rev-parse --is-inside-work-tree` plus `git var GIT_COMMITTER_IDENT` (the same identity predicate `git commit` applies, so it honours `user.useConfigOnly` and the hostname-derived fallback). Tagged `fast`.
 
 - Pass: `memory_dir` is a git repository and a committer identity resolves.
-- Warn: `git.auto_commit` is enabled but `memory_dir` was never `git init`-ed, or no identity resolves (git would fail with `Author identity unknown`). In both cases the file lands on disk but the git-persistence guarantee is silently not in force — the save response carries `git_committed: false` with the reason in `git_error` (#1025).
+- Warn: `git.auto_commit` is enabled but `memory_dir` was never `git init`-ed, or no identity resolves (git would fail with `Author identity unknown`). In both cases the file lands on disk but the git-persistence guarantee is silently not in force — the save response carries `git_committed: false` with the reason in `git_error`.
 - Info: `git.auto_commit` is disabled — nothing to check.
 
 #### `git_remote_health`
@@ -222,6 +264,25 @@ Runs `git -C ${memory_dir} ls-remote origin HEAD` with an 8s timeout. Tagged `de
 - Pass: remote reachable; reports unpushed commit count.
 - Warn: remote unreachable (DNS, SSH key, URL, transient network) or unpushed count > 50.
 - Info: `memory_dir` is not a git repo, or has no remote configured. This is not a failure — offline-only stores are valid — but the check surfaces the absence of an offsite backup channel as a forward-looking risk.
+
+#### `store_tree_clean`
+
+Runs `git -C ${memory_dir} status --porcelain --untracked-files=all` and counts modified and untracked files. Tagged `fast` (local, no network).
+
+- Pass: the tree is clean, or has at most 10 uncommitted files (an operator's in-progress config edit is not drift). The count is reported either way.
+- Warn: more than 10 uncommitted files. Every store write is supposed to commit with provenance, so a growing count means some writer is skipping its commit. `git status` stops being a "what changed" signal, and a `git checkout` or `git stash` would discard the drift.
+- Info: `memory_dir` is not a git repository, or git is unavailable.
+
+The complement to `git_remote_health`, which counts unpushed *commits* and says nothing about uncommitted *files*. The case that motivated it: the deferred description backfill wrote frontmatter without committing for two weeks, 572 files, on a store whose doctor was otherwise green.
+
+To commit an existing backlog in one step on a live store:
+
+```bash
+git -C "$PALINODE_DIR" add -A -- people projects decisions insights research inbox daily
+git -C "$PALINODE_DIR" commit -m "palinode: commit uncommitted store writes"
+```
+
+Then re-run doctor. If the count climbs again, find the writer: every store write must go through `palinode.core.git_tools`.
 
 #### `audit_log_writable`
 
@@ -508,6 +569,7 @@ palinode doctor --json | jq -e '.[] | select(.passed == false)' >/dev/null && ec
 - Missing `entities:` lists and `description:` fields
 - Core file count (warn if > 10)
 - Wiki drift (frontmatter entities vs body `[[wikilinks]]`)
+- Relative dates ("yesterday", "last Tuesday") that will rot, each with the absolute date it resolves to — or `unresolvable` and why
 
 ```bash
 palinode lint               # text report (default)

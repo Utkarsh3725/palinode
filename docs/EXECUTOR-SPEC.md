@@ -7,8 +7,7 @@ checkout, so tests and future ports can assert this contract without
 reverse-engineering implementation details.
 
 The source of truth for memory remains markdown files on disk. SQLite search
-indexes are derived state. Related private derivation notes are intentionally
-not quoted or linked from this public spec.
+indexes are derived state.
 
 ## Scope
 
@@ -23,9 +22,13 @@ stats dict:
     "merged": 0,
     "superseded": 0,
     "archived": 0,
+    "archived_by_range": 0,
     "retracted": 0,
     "merge_rejected": 0,
     "protected_rejected": 0,
+    "contradicts_proposed": 0,
+    "unmatched": 0,
+    "review_flagged": 0,
 }
 ```
 
@@ -36,7 +39,9 @@ The executor dispatch handles these AI consolidation operations:
 - `MERGE`
 - `SUPERSEDE`
 - `ARCHIVE`
+- `ARCHIVE_BEFORE`
 - `RETRACT`
+- `PROPOSE_CONTRADICTS`
 
 Explicit operation strings outside that set have no dispatch branch and are
 silently skipped.
@@ -104,13 +109,15 @@ removing one leading `- ` or `* ` list marker if present.
 
 | Field | Contract |
 | --- | --- |
-| Required fields | Non-empty `ids`, `new_text`. |
+| Required fields | Non-empty `ids`, `new_text`. Optional `rationale` or `reason`; `rationale` wins when both are present. |
 | Preconditions | `ids[0]` matches a list-item fact in current content. If `nightly_policy=True`, every source ID must match a fact whose text starts with `[YYYY-MM-DD]`, and all extracted dates must be identical. |
 | Postconditions | The first source fact is updated with normalized `new_text`, then its marker is rewritten from `<!-- fact:<ids[0]> -->` to `<!-- fact:merged-<ids[0]> -->`. For each remaining source ID, every matching single-line list item is removed. |
+| Identical text | When normalized `new_text` equals `ids[0]`'s current text, the merge still runs: `ids[0]`'s line is left byte-identical (text **and** ID — nothing is rewritten, so nothing is renamed) and `ids[1:]` are retired as above, recorded as merged into `<ids[0]>`. A source ID in `ids[1:]` equal to `ids[0]` is skipped in this case, since with no `merged-` rename its pattern would also match the surviving line. `merged += 1` iff at least one `ids[1:]` line was removed; if there is nothing left to retire the whole op is an unmatched no-op. |
 | Source removal | Source facts after the first ID are removed from the main file. The first source remains as the merged fact with the `merged-` ID. If a remaining source ID appears on multiple matching list-item lines, all matching lines are removed. |
-| History | None. |
+| History | Before mutation, every source fact's original text is appended verbatim to the corresponding history file — one entry per retired line, tagged with that source's own fact ID: `Merged into merged-<ids[0]> (YYYY-MM-DD): <old_text> (reason: <reason>) <!-- fact:<source-id> -->`. `ids[0]` is recorded with its pre-merge text (its text is replaced in place); each removed `ids[1:]` line is recorded (a duplicate-ID line is recorded once per line). In the identical-text case `ids[0]` is not recorded — its text does not change — and the entries name `<ids[0]>` as the merge target instead of `merged-<ids[0]>`. Source IDs that match nothing produce no entry. A no-op MERGE writes no history. |
 | Stats | `merged += 1` only if content changed. With nightly rejection, `merge_rejected += 1`. |
-| Failure behavior | Missing or empty `ids`, missing or empty `new_text`, or no match for `ids[0]` produces a silent no-op. Source IDs after the first that do not match are ignored. |
+| Failure behavior | Missing or empty `ids`, missing or empty `new_text`, or no match for `ids[0]` produces a no-op with no history append, counted as `unmatched` and logged. Source IDs after the first that do not match are ignored. |
+| Outcome reporting | When the caller passes the optional `applied_merges` list, the index into `operations` of every MERGE that was applied is appended to it. The consolidation runner uses this to log a `[MERGE]` line in a status document's Consolidation Log only for merges that happened — a dropped, unmatched, or nightly-rejected MERGE leaves no line. |
 
 ### SUPERSEDE
 
@@ -129,25 +136,141 @@ removing one leading `- ` or `* ` list marker if present.
 
 | Field | Contract |
 | --- | --- |
-| Required fields | `id`. Optional `rationale` or `reason`; `rationale` wins when both are present. |
-| Preconditions | A list-item line containing `<!-- fact:<id> -->` exists, and the file is not protected by `update_policy: replace`. |
+| Required fields | `id`. Optional `rationale` or `reason`; `rationale` wins when both are present. Optional `superseded_by`, read only by the retirement-policy guard below. |
+| Preconditions | A list-item line containing `<!-- fact:<id> -->` exists, the file is not protected by `update_policy: replace`, and either the file's retirement policy is `age-eligible` or the operation carries a non-empty `superseded_by`. |
 | Postconditions | Every matching single-line fact item is removed from the main file. |
 | Source removal | Matching source facts are removed from the main file. If the same fact ID appears on multiple matching list-item lines, all matching lines are removed. |
-| History | Before removal, the first matching line's text is appended as `Archived: <old_text> (reason: <reason>) <!-- fact:<id> -->` to the corresponding history file. |
-| Stats | `archived += 1` only if content changed. With replace-guard rejection, `protected_rejected += 1`. |
+| History | Before removal, the first matching line's text is appended as `Archived: <old_text> (reason: <reason>) <!-- fact:<id> -->` to the corresponding history file. `superseded_by` is not written to the history entry. |
+| Stats | `archived += 1` only if content changed. With replace-guard or retirement-policy rejection, `protected_rejected += 1`. |
 | Failure behavior | Missing `id` or no matching fact ID produces a silent no-op. |
+
+### ARCHIVE_BEFORE
+
+Bulk retirement of dated status log lines: one operation, one rationale, a
+whole date range. A status document fed by session-end gains one
+`- [YYYY-MM-DD] …` line per session, and a proposal that names each stale line
+individually grows with the document rather than with the number of judgments
+— at several hundred lines it exceeds any workable token cap, is truncated,
+and retires nothing at all.
+
+| Field | Contract |
+| --- | --- |
+| Required fields | `before`, a `YYYY-MM-DD` date. Optional `rationale` or `reason`; `rationale` wins when both are present. |
+| Subject | Every **dated log line** in the body strictly older than `before` — see "Dated Log Lines" below for the recognizer. The op names no fact id; an `id` field, if present, is ignored by the executor (the propose-side footer rule still reads it). |
+| Preconditions | At least one dated log line older than `before`, the file is not protected by `update_policy: replace`, and the file's retirement policy is `age-eligible`. |
+| Postconditions | Each matching line is removed exactly as a single `ARCHIVE` of that line would remove it, in document order, against the running content — so a line an earlier operation in the same call already archived is not counted twice. |
+| History | One `Archived: <old_text> (reason: <reason>) <!-- fact:<id> -->` entry per removed line, as `ARCHIVE` writes. The main file plus its history sibling remain lossless. |
+| Stats | `archived += N` and `archived_by_range += N`, where N is the number of lines removed. The range is counted with every other archive so no summary undercounts what left the file, and separately so an operator can see which retirements were argued by date. |
+| Failure behavior | A missing or unparseable `before` is dropped with a warning and `unmatched += 1`; a well-formed range that matches no line is likewise `unmatched += 1`. Neither mutates the file or writes history. |
+| Retirement policy | Rejected outright on a `superseded-only` document with `protected_rejected += 1`. A date range argues purely from age, and unlike a single `ARCHIVE` there is no `superseded_by` that could make it a stated supersession — the field is ignored if present. |
+| Outcome reporting | When the caller passes the optional `applied_ranges` list, the index into `operations` of every `ARCHIVE_BEFORE` that removed at least one line is appended to it, exactly as `applied_merges` reports applied merges. The consolidation runner logs a `[ARCHIVE_BEFORE] before <date>: <rationale>` line in the status document's Consolidation Log only for ranges that retired something. |
+
+### Dated Log Lines
+
+The recognizer `ARCHIVE_BEFORE` and the runner-side age sweep share, in
+`palinode.consolidation.log_lines`. A dated log line is a markdown list item in
+the document **body** whose text begins, immediately after the `-`/`*` marker,
+with a `[YYYY-MM-DD]` tag that parses as a real date, and which carries a
+`<!-- fact:<id> -->` marker:
+
+```markdown
+- [2026-03-04] Shipped the retrieval receipt. (2 decisions → daily/2026-03-04.md) <!-- fact:proj-status-9c1f02 -->
+```
+
+That is the rendering `POST /session-end` appends and the same anchored date
+the nightly MERGE guard reads.
+
+**Recognition is by shape, never by section**, because of where those lines
+actually are. The session-end writer appends to the *end of the file*, and
+`## Consolidation Log` is the last section a status document has — so the dated
+session lines land **inside** it, below the `_[log elided]_` bullet and
+interleaved with the `### <date>` blocks of `- [UPDATE] <id>: …` operation
+records the runner writes:
+
+```markdown
+## Consolidation Log
+
+- _[log elided] 291 operation line(s) across 48 date block(s) — 2026-03-31 → 2026-06-28. Full detail in git history._
+
+- [2026-03-31] Test session: launched Palinode v0.5.0, … <!-- fact:proj-status-84109d -->
+### 2026-06-28
+- [UPDATE] proj-status-5f93e9: rewrote the endpoint fact
+- [2026-06-28] Shipped the v0.8.16 systemd reconciliation. <!-- fact:proj-status-1a2b3c -->
+```
+
+A recognizer that excluded that section would match nothing on a real status
+document. The two kinds of line sharing the section are excluded by their own
+shape instead: an **operation record** opens with an op word rather than a date
+(`- [UPDATE] …`, `- [ARCHIVE] …`, any `- [OP_WORD] …`), and the **elision
+bullet** opens with `_[log elided]`. Both are the audit trail *of* retirement,
+which retiring would consume.
+
+Also deliberately **not** log lines: a bullet with no date tag; a bullet whose
+date is not at the start; a line the executor already retired in place
+(`~~…~~ [superseded …]` — the strike comes before the date, so a tombstone is
+never re-retired); anything inside a fenced code block; anything at or after
+`<!-- palinode-auto-footer -->`.
+
+`### <date>` headings are not list items and are never removed. A session line
+parses as a *raw* item outside any date block in `status_doc`'s log parser, so
+removing one cannot empty a block, cannot disturb the block/line bounding, and
+leaves nothing for `palinode repair-status` to rewrite.
+
+Both callers compare strictly (`moment < cutoff`), so `ARCHIVE_BEFORE` keeps a
+line dated exactly `before`, and an N-day window keeps a line dated exactly N
+days ago.
+
+### Age Retirement (runner-side)
+
+Deciding that a log line is older than a configured window is arithmetic, not
+judgement, so the consolidation runner does it itself — no model, no proposal.
+Before it builds a group's prompt, `run_consolidation` sweeps the group's
+target (`runner._retire_aged_log_lines`):
+
+| Field | Contract |
+| --- | --- |
+| Window | `consolidation.status_log_retention_days`, default 90. `0` disables the sweep entirely. |
+| Eligibility | The target is classified by the same `palinode.consolidation.retirement.classify` the Retirement Policy Guard reads. A `superseded-only` document is skipped before any operation is built, so the guard cannot fire on this path — a rejection here would mean the two had drifted. |
+| Subject | Dated log lines (above) strictly older than `now - window`. |
+| Application | Ordinary `ARCHIVE` operations, one per line, through `apply_operations` — the same executor, the same history sibling, the same lossless contract. The rationale names the actor, the line's date and the window: `age-retention: status log line dated <date> is older than <N> days; retired by policy (consolidation.status_log_retention_days)`. |
+| Provenance | Its own commit (`<prefix> age-retention: N status log line(s) older than Nd`) and a single `## Consolidation Log` line naming the range it retired, rather than one line per fact. |
+| Reporting | `age_retired` in the weekly run summary, dry run included. A dry run counts and applies nothing. |
+| Pass scope | Weekly only. The nightly pass does not sweep and its summary carries no `age_retired` key. |
+
+The prompt is assembled *after* the sweep, so `EXISTING_FACTS` holds the
+retention window rather than the whole backlog — which is what the compaction
+prompt (v5) means when it tells the model that lines already retired by policy
+are not in front of it.
 
 ### RETRACT
 
 | Field | Contract |
 | --- | --- |
-| Required fields | `id`. Optional `reason` or `rationale`; `reason` wins when both are present. |
-| Preconditions | A list-item line containing `<!-- fact:<id> -->` exists, and the file is not protected by `update_policy: replace`. |
+| Required fields | `id`. Optional `reason` or `rationale`; `reason` wins when both are present. Optional `falsified_by`, read only by the retirement-policy guard below. |
+| Preconditions | A list-item line containing `<!-- fact:<id> -->` exists, the file is not protected by `update_policy: replace`, and either the file's retirement policy is `age-eligible` or the operation carries a non-empty `falsified_by`. |
 | Postconditions | The first matching fact text is wrapped in strikethrough and followed by `[RETRACTED YYYY-MM-DD]` or `[RETRACTED YYYY-MM-DD — <reason>]`, preserving the original fact marker. |
 | Source removal | None. The tombstone remains visible in the main file. |
-| History | Appends `Retracted (YYYY-MM-DD): <reason> <!-- fact:<id> -->` to the corresponding history file. |
-| Stats | `retracted += 1` only if content changed. With replace-guard rejection, `protected_rejected += 1`. |
+| History | Appends `Retracted (YYYY-MM-DD): <reason> <!-- fact:<id> -->` to the corresponding history file. `falsified_by` is not written to the history entry or the tombstone. |
+| Stats | `retracted += 1` only if content changed. With replace-guard or retirement-policy rejection, `protected_rejected += 1`. |
 | Failure behavior | Missing `id` or no matching fact ID produces a silent no-op. |
+
+### PROPOSE_CONTRADICTS
+
+Records a typed `contradicts` link in the target file's frontmatter. It is the
+no-winner counterpart to `SUPERSEDE`: two memories disagree, neither is retired,
+and the conflict is surfaced for review (`lint` `open_contradictions`, `trace`,
+and the search-result marker). `SUPERSEDE` remains the only winner-picking op.
+
+| Field | Contract |
+| --- | --- |
+| Required fields | The refs to link, read from `contradicts`, else `refs`, else `ids` — first present key wins. A single string is accepted and coerced to a one-element list. Any other field (`id`, `rationale`) is ignored by the executor; the runner's consolidation log reads them. |
+| Ref format | Each ref is a `category/slug` memory identity, validated by `palinode.core.typed_links.normalize_link_refs`: non-empty string, no `..`, no leading `/`, no newline. Duplicates are dropped, order preserved. |
+| Preconditions | None on the body. **Not** subject to the `update_policy: replace` guard — recording a conflict forks nothing into history. |
+| Postconditions | The normalized refs are merged into the frontmatter `contradicts:` list (idempotent — refs already present are not duplicated). The body and every other frontmatter field are preserved verbatim. Later operations in the same call operate on the re-split body. |
+| Source removal | None. Nothing is retired, tombstoned, or moved to history. |
+| History | None. No `-history.md` write and no dependency propagation — `contradicts` is an association edge, not an extension edge. |
+| Stats | `contradicts_proposed += 1` only if the frontmatter changed. |
+| Failure behavior | A malformed ref list is rejected as a whole with a warning (`PROPOSE_CONTRADICTS rejected (malformed refs)`), no stat increment, no mutation. Missing/empty refs are a silent no-op. |
 
 ## Validation and Rejection Rules
 
@@ -166,8 +289,8 @@ No stats are incremented.
 If `op` is absent, the executor treats the operation as `KEEP` and increments
 `kept`.
 
-If `op` is present but does not match one of the six handled AI operations, the
-executor silently skips it with no mutation and no stat increment.
+If `op` is present but does not match one of the handled AI operations,
+the executor silently skips it with no mutation and no stat increment.
 
 ### Missing Required Fields
 
@@ -179,8 +302,8 @@ not increment success stats or rejection stats.
 Before applying operations, the executor parses the target file frontmatter
 through the shared markdown parser. If parsed metadata contains
 `update_policy: replace`, the document is treated as a living current-state
-document. `SUPERSEDE`, `ARCHIVE`, and `RETRACT` are rejected before helper
-execution.
+document. `SUPERSEDE`, `ARCHIVE`, `ARCHIVE_BEFORE`, and `RETRACT` are rejected before
+helper execution.
 
 For each guarded rejection:
 
@@ -195,6 +318,150 @@ If parsing fails or parsed metadata does not contain `update_policy: replace`,
 the guard falls open and does not protect the file. If the raw text contains
 `update_policy: replace` but parsed metadata does not, the executor logs a
 warning about possible frontmatter corruption and still falls open.
+
+### Retirement Policy Guard
+
+Eligibility for **age-based** retirement is a property of the document, not of
+the fact's age. Before applying operations, the executor classifies the target
+document from its own path and frontmatter into one of two regimes:
+
+- `age-eligible` — episodic documents: daily notes, insights, research, status
+  documents (`projects/<slug>-status.md`), decisions, inbox items, and anything
+  unclassified. This is the default and the pre-existing behavior.
+- `superseded-only` — identity / profile documents: files under `people/`, a
+  project's profile document (`projects/<slug>.md`, as distinct from its
+  `-status.md` layer), `type: PersonMemory`, `category: person`,
+  `update_policy: replace`, and `core: true`.
+
+A document may declare its own regime with a `retirement_policy:` frontmatter
+field, whose value is `age-eligible` or `superseded-only`. The declaration wins
+over every inferred signal, in both directions; an unrecognized value is logged
+and ignored, and classification falls back to the inferred regime.
+
+On a `superseded-only` document, `ARCHIVE` is rejected unless the operation
+carries a non-empty `superseded_by`. That field is the whole distinction between
+the two retirement arguments the executor can tell apart deterministically:
+naming a successor states a supersession, while its absence leaves age or
+staleness as the only argument, and age is not a retirement reason for these
+documents. The rationale text is never parsed; it is logged with the rejection.
+
+On the same documents, `RETRACT` is rejected unless the operation carries a
+non-empty `falsified_by` — the RETRACT analogue of `superseded_by`, naming the
+memory or fact in the proposal's context that falsifies the retracted one.
+RETRACT remains a sanctioned retirement path for identity documents (a fact
+that was never true may be retracted whatever the document's class), but a
+retraction that cites nothing is indistinguishable, in the operation, from one
+argued by age or fabricated outright; the field is the evidence requirement.
+As with `superseded_by`, the executor checks only that the field is present
+and non-blank. It does not resolve the reference: the proposer is responsible
+for citing something in its context, and holding it to that — downgrading an
+uncited RETRACT before it reaches the executor — is the runner's job, not this
+guard's. The rationale text is never parsed.
+
+For each rejection:
+
+- content is unchanged, and no history entry is written;
+- a warning is logged naming the signal that classified the document and the
+  operation's rationale;
+- `protected_rejected += 1`;
+- `archived` / `retracted` does not increment.
+
+`SUPERSEDE` is not affected by this guard — its evidence is the `new_text` it
+carries — and neither are `KEEP`, `UPDATE`, `MERGE`, or
+`PROPOSE_CONTRADICTS`. Whole-file retirement outside the executor (the on-demand
+archive path, which requires an explicit reason from a caller who is not the
+compaction model) is likewise untouched. If frontmatter parsing fails, the guard
+falls open to `age-eligible`, for the same reason the replace guard falls open:
+a malformed file must never block consolidation.
+
+The same classification governs the TTL sweep, which skips `superseded-only`
+documents whose `expires_at` has passed rather than archiving them.
+
+### Consolidation Input (prompt assembly)
+
+The consolidation runner builds its input in `_assemble_prompt`. Two of the
+prompt's sections are filtered through the lifecycle classifier in
+`palinode.core.lifecycle` — the same pure, clock-injected function the
+session-start digest selects through, so recall and consolidation cannot
+disagree about what is current:
+
+- **`ACTIVE_DECISIONS` holds only governing decisions.** A decision under
+  `decisions/` naming the project is rendered only when the classifier does
+  not report it *retired*: `status` (or KU `lifecycle`) of `archived`,
+  `deprecated`, `superseded` or `retracted`, a non-empty `superseded_by`, an
+  `expires_at` at or before now, or an `archive/` directory segment in the
+  record's path all withhold it. A decision with no `status` at all is
+  *unmarked* and remains governing, as it always has — unless it sits under
+  `archive/`, where nothing is ever unmarked. The
+  `PromptContext.decision_refs` the runner guard checks against are the refs
+  actually rendered, so a withheld decision is not "in context" either. The
+  section is omitted entirely when nothing governs.
+- **`EXISTING_FACTS` holds only current facts.** A tagged bullet the executor
+  has already retired in place — the whole text struck through and followed
+  by Palinode's own marker, `~~…~~ [superseded YYYY-MM-DD]` (SUPERSEDE) or
+  `~~…~~ [RETRACTED YYYY-MM-DD …]` (RETRACT, and the mention-level retract's
+  `r:<id>` form) — is moved to a separate block:
+
+  ```
+  ## RETIRED_FACTS (N superseded or retracted — history, not current state)
+
+  [old] ~~Endpoint A.~~ [superseded 2026-09-10]
+  ```
+
+  rendered between `EXISTING_FACTS` and `ACTIVE_DECISIONS`, with the same id,
+  text and marker the file carries, so source identity and history are
+  preserved and a `RETRACT` may still cite a retired fact as in-context
+  evidence (`PromptContext.fact_ids` includes them). The `EXISTING_FACTS`
+  count is the current facts only. Recognition is deliberately narrow: only
+  the executor's renderings qualify; user-authored strikethrough inside a
+  sentence, or a mention strike that leaves the rest of the bullet standing,
+  is a current fact. Neither this filtering nor the block changes what the
+  executor does with an operation against a retired id — a tombstone can
+  still be `ARCHIVE`d into history as before. ARCHIVE'd facts do not appear
+  in either block: they were removed from the file and live only in the
+  `-history.md` sibling.
+- **The index projects the same renderings out.** The indexer derives each
+  section's search text through `palinode.core.projection`, which removes a
+  whole line the recognizer above classes as retired and, for the
+  mention-level `[RETRACTED YYYY-MM-DD r:<id>].` form, just the struck span.
+  FTS5 and the vector index are built from that projected text, so a retired
+  assertion does not rank beside its successor; the raw file, the
+  `-history.md` sibling, `git log` and `palinode_blame` keep the tombstone.
+  The projection is versioned (`PROJECTION_VERSION`) and stored with a hash of
+  the derived text, separate from the raw section hash that index/source
+  freshness and quote anchors are checked against.
+
+### Runner Guard (propose-side)
+
+The executor never sees the prompt, so it cannot tell whether the memory a
+`RETRACT` names as its evidence was ever in front of the model. That check is
+the consolidation runner's, in `palinode/consolidation/proposal_guard.py`, and
+it runs on the parsed operations before the pass's `allowed_ops` filter and
+before `apply_operations`. It is deterministic and never calls the model. From
+the prompt it built, the runner records what was in context — the
+`EXISTING_FACTS` ids, the refs of the `ACTIVE_DECISIONS` it rendered, and the
+refs of the `RECENT_NOTES` that fit the budget — and applies two rules:
+
+- **An uncited `RETRACT` is downgraded to `PROPOSE_CONTRADICTS`.** The op's
+  `falsified_by` must resolve to one of those identifiers (`category/slug`,
+  `category/slug.md`, or a fact id); when the field is absent, a memory ref or
+  fact id named as a whole token in the rationale is accepted instead, the
+  retracted fact's own id excepted. Resolution is all that is checked: a
+  citation is necessary evidence, not proof. The downgraded op is
+  `{"op": "PROPOSE_CONTRADICTS", "id": <same id>, "contradicts": [<the group's
+  latest note ref>], "rationale": "<original reason> (downgraded from RETRACT:
+  no in-context evidence cited)"}`; when no well-formed note ref exists to link
+  to, the op is dropped instead. Either way the `RETRACT` is never applied,
+  a warning is logged, and `retract_downgraded += 1`.
+- **A retiring op aimed at the auto-footer is rejected.** A `RETRACT`,
+  `ARCHIVE`, `ARCHIVE_BEFORE` or `SUPERSEDE` whose `id` is a bullet at or after
+  `<!-- palinode-auto-footer -->` is dropped with a warning and
+  `footer_op_rejected += 1`. Footer wikilinks are navigation, not claims.
+
+Both counts appear in the weekly and nightly run summaries (dry-run included),
+alongside the executor's stats. The two guards compose: the runner checks that
+a `RETRACT`'s evidence was in context; the Retirement Policy Guard above checks
+that, on a superseded-only document, the op carries the field at all.
 
 ### Nightly MERGE Guard
 
@@ -218,10 +485,12 @@ When `nightly_policy=False`, this guard is not applied.
 | --- | --- |
 | `KEEP` | Stable; increments `kept` each time. |
 | `UPDATE` | Stable when reapplying the same replacement to the same retained ID. If the second replacement would not change content, `updated` does not increment on that second run. |
-| `MERGE` | Not generally re-runnable. The first run rewrites `ids[0]` to `merged-<ids[0]>`, so a second run using the original IDs usually cannot match the first source ID and becomes a silent no-op. Remaining source facts may already be removed. |
+| `MERGE` | Not generally re-runnable. The first run rewrites `ids[0]` to `merged-<ids[0]>`, so a second run using the original IDs usually cannot match the first source ID and becomes a no-op with no history append. Remaining source facts may already be removed. The identical-text case keeps `ids[0]`'s ID, so a second run matches it again but finds no `ids[1:]` lines left to retire: content is unchanged, no history is appended, `merged` does not increment. |
 | `SUPERSEDE` | Not a pure no-op. The original fact ID remains on the tombstoned line, so the same operation can match it again, wrap the already tombstoned text again, insert another `supersedes-<id>` line, append history again, and increment `superseded` again. |
 | `ARCHIVE` | Usually becomes a no-op after the first run because the source line is removed. |
+| `ARCHIVE_BEFORE` | Becomes an unmatched no-op after the first run: every line older than `before` has been removed, so the recognizer finds nothing and `unmatched` increments instead of `archived`. |
 | `RETRACT` | Not a pure no-op. The original fact ID remains on the tombstoned line, so the same operation can tombstone the already tombstoned text again, append history again, and increment `retracted` again. |
+| `PROPOSE_CONTRADICTS` | Idempotent. A ref already in the `contradicts:` list is not duplicated, the content is unchanged, and `contradicts_proposed` does not increment on the second run. |
 
 ## Write, History, and Git Semantics
 
@@ -234,9 +503,11 @@ file, replace the target via `os.replace`, and fsync the target directory. On
 write failure, the temporary file is removed when possible and the exception is
 raised.
 
-`ARCHIVE`, `SUPERSEDE`, and `RETRACT` preserve history in a sibling history
-file. The history path is derived by stripping a trailing `-status.md` or `.md`
-from `file_path` and appending `-history.md`.
+`MERGE`, `ARCHIVE`, `ARCHIVE_BEFORE`, `SUPERSEDE`, and `RETRACT` preserve history in a sibling
+history file — every op that retires a fact's current text writes to the
+sibling, so the main file plus its history sibling are together lossless
+without recourse to git. The history path is derived by stripping a trailing
+`-status.md` or `.md` from `file_path` and appending `-history.md`.
 
 History entries are timestamped with current UTC to minute precision:
 
@@ -259,17 +530,182 @@ append. If they have no frontmatter, archived frontmatter is prepended. If they
 have frontmatter but no `status:` field, `status: archived` is injected. If
 they already have any `status:` field, that explicit status is preserved.
 
-`apply_operations` does not create git commits. Git commit behavior belongs to
-caller-layer paths such as the consolidation runner and write-time dedup flow.
-The returned stats dict is the executor's auditable record of what happened
-inside this call.
+`apply_operations` does not create git commits for the target file or its
+history sibling. Git commit behavior for those belongs to caller-layer paths
+such as the consolidation runner and write-time dedup flow. The one exception
+is dependency propagation (next section), whose writes land in other files and
+are committed by the propagation step itself. The returned stats dict is the
+executor's auditable record of what happened inside this call.
+
+## Dependency Propagation (`backed_by`)
+
+Typed links carry two different propagation semantics. `backed_by` is an
+extension edge — a dependent's claim rests on its source, so retiring the
+source must reach the dependent. `contradicts` is an association edge — two
+memories disagree, neither wins — and is surfaced by `lint`, never propagated.
+
+After the main file is written, if any `SUPERSEDE`, `ARCHIVE`, `RETRACT` or
+`MERGE` in the call changed content, the executor flags every dependent of the
+target file (`palinode.consolidation.propagate.flag_dependents`):
+
+| Field | Contract |
+| --- | --- |
+| Trigger | At least one retiring op (`SUPERSEDE` / `ARCHIVE` / `ARCHIVE_BEFORE` / `RETRACT` / `MERGE`) incremented its stat in this call. A rejected, unmatched, or dropped op does not trigger propagation. |
+| Source ref | The target file's memory-dir-relative path without `.md` (`project/foo` for `project/foo.md`). A `-status.md` layer is matched and recorded under its base ref (`project/foo` for `project/foo-status.md`), the identity the history writer uses. A target outside the memory dir has no dependents. |
+| Dependents | Every `.md` under the memory dir whose frontmatter `backed_by` names the source ref (with or without `.md`), excluding the source itself, `-history.md` siblings, skip-dir files (`archive/`, `logs/`, `daily/`, `inbox/`, `prompts/`, `.obsidian/`), unreadable frontmatter, and `status: archived` memories. Scanned in sorted path order. |
+| Write | One `stale_backing` entry is appended to the dependent's frontmatter list: `{ref: <source ref>, op: <kinds>, at: <UTC ISO-8601 seconds>, facts: [<retired ids>], reason: <joined reasons>}`. `op` is the retirement kinds that fired, lowercase, joined by `, ` in the order supersede, archive, retract, merge. `facts` and `reason` are omitted when empty. The body and every other frontmatter field are preserved; `status` is never changed. |
+| Idempotency | Keyed on `ref`: a dependent already carrying an entry for this source is not written, not re-indexed, not committed. Re-applying the same ops therefore flags nothing on the second run. |
+| Hops | One. Dependents of dependents are not walked. |
+| Index | Each written dependent is re-indexed through the frontmatter-only path (no re-embed) so the flag appears in search-result metadata. |
+| Git | All written dependents are staged and committed in one commit, `<prefix> backed_by review: <source ref> <kinds> -> N dependent(s)`, when `git.auto_commit` is on. |
+| Stats | `review_flagged` = number of dependents newly written in this call. |
+| Failure behavior | Best-effort per dependent: a dependent that cannot be read or written is logged and skipped; propagation never fails the retirement that triggered it. |
+| Clearing | Re-saving the dependent through any save surface rebuilds its frontmatter and drops the flag. No executor op clears it. |
+
+The on-demand `archive_memory` (archive / supersede of a whole file) and
+`retract_mentions` (strand-level retract) paths apply the same rule after
+their own commit, with `op` = `archive` / `supersede` / `retract`, and report
+the flagged rel paths as `review_flagged` in their result dicts. The TTL sweep
+does not propagate. Because archived dependents are skipped, `restore_memory`
+re-runs the one-hop check from the other side: on restore, each of the restored
+memory's own `backed_by` refs whose target is no longer active (`status:
+archived`, with or without `superseded_by`, or no file at `<ref>.md` /
+`<ref>-status.md`) gains an entry with `op` = `restore-check` and a `reason`
+naming the observed state, keyed on `ref` like every other entry, written and
+committed in the restore itself and reported as `stale_backing` in its result.
+
+## Read-Time Support Checks and Revalidation
+
+Propagation is a write-time flag: it fires when a retirement fires, walks one
+hop, and clears when the dependent is re-saved. Three things it cannot do —
+notice a source retired *since* the last pass, reach a conclusion two hops out,
+and tell a re-verification from a whitespace edit — are the read-time support
+check's job (`palinode.core.revalidation`). The check never writes and never
+rewrites prose; it reports, and the marker path below is what makes a report
+durable.
+
+| Field | Contract |
+| --- | --- |
+| Input | A record's `backed_by` refs, walked breadth-first to `search.evidence.max_support_hops` hops (default 2 — its own sources, and theirs). One read per distinct source; a source already visited is not revisited, so a cycle terminates and every source is reported at its shortest hop. Reads are charged against the request's `max_files`. |
+| Finding | `support_withdrawn` — the source is retired (archived, deprecated, superseded, expired, retired by location, or retracted with nothing named as falsifying it). `support_disproven` — the source names `falsified_by`, the evidence-gated RETRACT's field. `support_revision_changed` — the source is standing, but its current whole-file SHA-256 is not the revision this record recorded as revalidated. |
+| Not a finding | A ref no file answers to. Absence is coverage (`target_missing`), never a withdrawal. A source the requester may not see is `target_hidden` and contributes nothing else. A record with no `revalidated` entry for a source can never be "changed since": nothing was recorded. |
+| Coverage | `budget_exhausted:support_hops` when the walk stopped with backing left unexamined (the hop bound or the read budget). Joins the evidence layer's closed coverage vocabulary. |
+| Delivery | Findings become `stale_backing:<ref>@<hop>:<reason>` qualifiers on the resolution side, beside the `stale_backing:<ref>` a persisted flag already produced. No field is added to the `evidence` payload. |
+| Outcome | Whether a finding changes the resolution outcome is the record's own declaration — see the backing policy below. The outcome is never anything but `insufficient_evidence`: a lost source produces uncertainty, never the opposite claim and never the value a retired source used to carry. |
+
+### `backing_policy`
+
+Optional frontmatter, and the only thing that lets a checker conclude anything
+from a multi-source list.
+
+| Value | "Fully supported" means | Loses support when |
+| --- | --- | --- |
+| `all-of` | every named source is standing | any one of them is withdrawn or disproven |
+| `any-of` | at least one named source is standing | all of them are |
+| *(absent)* | nothing is asserted — advisory | all of them are (the rule the persisted flag always had) |
+
+An unrecognised or unreadable value reads as advisory: a policy that cannot be
+read must never make the checker more confident than a legacy list.
+
+### `revalidated`
+
+Optional frontmatter: `- {ref: <source ref>, revision: <source's whole-file
+SHA-256>, at: <UTC ISO-8601 seconds>}`, one entry per source ref. It is the
+explicit form of the convention that a re-save meant "I checked this against
+its sources" — which a formatting-only edit satisfied just as well.
+
+- A backing counts as revalidated only when the recorded `revision` equals the
+  source's **current** whole-file SHA-256 (`file_sha256`, the delivery
+  receipt's revision basis for a delivered record).
+- Recording the same `(ref, revision)` again is a no-op; a new revision
+  replaces that ref's entry, with the previous one in git.
+- A receipt never revives a withdrawn source. It clears the *revision* axis,
+  not the lifecycle one.
+
+### Persisting a check
+
+| Field | Contract |
+| --- | --- |
+| Enqueue | `revalidation.sweep_revalidations()` scans live records that declare backing (same skip rules as propagation, plus `status: archived`) and writes one write-time marker per record needing a write, with `item.kind = "revalidate"`. |
+| Apply | The existing sweep/worker drains it to `revalidation.apply_revalidation`, which **re-checks against live disk** — a marker can outlive the state that produced it — then appends one `stale_backing` entry per unflagged finding (`op: revalidate-check`, with `hop`, `reason` and `via`), removes the entries an explicit revalidation cleared, re-indexes through the frontmatter-only path and commits `<prefix> backing revalidation: <ref> +N flagged, -M cleared`. |
+| Clearing | One rule: an entry is removed only when its source is standing again **and** the record carries a `revalidated` receipt matching that source's current revision. A re-save still drops the flag as it always did — but the check re-derives it on the next pass, so a formatting edit no longer ends the matter. |
+| Never | No body is rewritten, no `status` is changed, and no replacement value is derived from a source's change. A replacement only ever comes from an explicit `superseded_by` chain. |
+| Failure | Best-effort per record: an unreadable or unwritable target is counted `skipped` and logged; a corrupt marker is renamed `.failed.json` for an operator, like every other marker. |
+
+## Proposers and the `lint` Actor
+
+`apply_operations` does not know or care who proposed an operation. Two
+proposers reach it today, and the difference is recorded outside the executor,
+in the provenance its callers write.
+
+The LLM proposer is the consolidation runner's compaction pass. The second is
+deterministic: `palinode lint --propose` maps lint findings onto operations —
+one finding class per operation, no wording invented — and `--apply` hands the
+applicable ones to the existing callers with `source="lint"`. There is no new
+write path. A whole-document retirement goes through the on-demand
+`archive_memory`, which is already specified above; an operation addressed to a
+file's content goes through `runner.apply_proposed_operations`, which performs
+the same pre-apply fact-id capture, `apply_operations` call, status-document log
+entry and one-mutation-one-commit staging as the weekly pass.
+
+What the actor changes is the audit trail, in the two durable places:
+
+| Surface | With a `lint` actor |
+| --- | --- |
+| History sibling | The entry gains a trailing `[actor: lint]`, after the reason. |
+| Commit subject | `archive_memory` appends `(actor: lint)`; `runner.apply_proposed_operations` writes `<prefix> lint-proposed ops: <kinds>`. |
+| Status document | The `## Consolidation Log` line carries the proposal's rationale, which begins `lint:`. Written only when the target is a `-status.md` document. |
+
+Absent an actor — a direct CLI, API or MCP call — nothing changes; the messages
+are byte-identical to what they were.
+
+The deterministic proposer emits a deliberately small vocabulary: whole-document
+`ARCHIVE`, `PROPOSE_CONTRADICTS`, and the one `UPDATE` described below.
+Operations that require *invented* replacement text (`MERGE`, `SUPERSEDE`, and
+any other `UPDATE`) are not proposed by it, because choosing that text is
+judgement; those findings are emitted as advisory `PROPOSE_*` notes for a human
+and are never applied. Age-based `ARCHIVE` is additionally restricted by
+document class (ADR-020) and honours `consolidation.allowed_ops`.
+
+That document-class restriction is two layers, and the deterministic proposer
+keeps them separate. The first is the ADR-020 invariant: the proposer calls the
+same classifier the Retirement Policy Guard above reads, so a `superseded-only`
+document is never nominated for an age-argued `ARCHIVE` and the proposer and the
+executor cannot drift on what an identity document is. The second is
+proposal-side conservatism — a short local list of classes the proposer declines
+to nominate even though the guard would accept them, which today holds
+`decisions/` alone (ADR-020 calls that regime conservative, not forbidden). A
+status document, `projects/<slug>-status.md`, is age-eligible in both layers and
+is proposed. Every skipped finding records which layer stopped it:
+`retirement_policy: superseded-only (<signal>)` names the invariant and the
+signal that classified the document, `proposer: conservative class` names the
+preference. The proposer may be stricter than the guard; it must never be looser,
+since a proposal the guard is obliged to reject is a proposer bug rather than a
+policy difference. The conservatism applies only to documents nobody classified:
+an explicit `retirement_policy: age-eligible` declaration in a `decisions/`
+document's frontmatter overrides it, and that document is proposed like any other
+age-eligible one. The declaration already wins over the classifier's inferred
+signals; it wins over the proposer's caution for the same reason, and the
+recorded skip reason for an undeclared decision names the declaration as the way
+to opt in.
+
+The exception is a relative date, where the replacement text is arithmetic and
+not judgement: "yesterday" in a memory whose `created_at` is 2026-09-10 means
+2026-09-09, and the lint pass computes it with the same normaliser that runs at
+write time. A `relative_dates` finding on a list-item fact therefore maps to an
+ordinary `UPDATE` — `id` is the fact's own id, `new_text` is the fact's text
+with the phrase replaced — carrying the phrase and the anchor in its rationale.
+The contract above is unchanged: the executor sees a normal `UPDATE` and neither
+knows nor cares that lint proposed it. Findings that resolve to no date (vague
+phrases, intervals, an undated memory), and findings whose phrase sits in quoted
+text, a blockquote or code, are recorded as skipped with the reason instead;
+`UPDATE` must also be in `consolidation.allowed_ops` for the proposal to be
+applicable.
 
 ## Divergence Notes
 
-DIVERGENCE / TODO: ADR-016 and private derivation notes describe human
-actor-class operations such as `CREATE`, `REVISE`, `APPROVE`, and `REJECT`, but
-current `apply_operations` dispatch handles only the six AI operations listed
-in this spec. Explicit unknown op strings are silently skipped.
+`apply_operations` handles only the operations listed in this spec.
+Explicit unknown op strings are silently skipped.
 
 DIVERGENCE / TODO: In this checkout,
 `palinode/consolidation/op_registry.py` is not present, despite derivation

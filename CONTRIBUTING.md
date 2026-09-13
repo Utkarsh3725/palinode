@@ -129,10 +129,9 @@ rebuildable from the files alone. If a change makes the index authoritative for
 anything, that is a design bug. The test: if you delete the database, nothing the user
 cares about should be lost.
 
-**2. Model output never writes files directly.** The LLM emits structured operations;
-Palinode validates them, applies the resulting change through its write path, and
-git-commits the result. Any code path where model-generated content reaches the
-filesystem without that validation will be rejected.
+**2. Writes must be validated.** Memory changes must pass the applicable path,
+content, and retirement checks and use the existing write functions. A new path
+that skips those checks will be rejected.
 
 **3. Every write is committed with provenance.** A memory that changed without a
 commit recording who changed it and why is not auditable, which defeats the purpose.

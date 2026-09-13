@@ -32,11 +32,11 @@ is checked AND `mcp-tool-coverage` CI is green on the release SHA.**
 
 ## Release requirements
 - [ ] PyPI package published (`pip install palinode` resolves)
-- [ ] GitHub org migration complete (#118)
+- [ ] GitHub org migration complete
 - [ ] Integration test suite green on CI
-- [ ] Security test suite green on CI (#123)
-- [ ] CI/CD pipeline active (#121)
-- [ ] MCP audit log (#116)
+- [ ] Security test suite green on CI
+- [ ] CI/CD pipeline active
+- [ ] MCP audit log
 
 ## Docs + marketplace
 - [ ] README polished (screenshots, install paths, quick-start)
@@ -51,26 +51,26 @@ is checked AND `mcp-tool-coverage` CI is green on the release SHA.**
 - [ ] Pre-launch: resolve any open `P0`/`P1` labeled issues
 
 ## Hardening (M1)
-- [ ] `palinode doctor` umbrella complete — all planned checks in (#190)
-- [ ] MCP config consistency (`palinode mcp-config --diagnose`) working across all platforms (#189)
-- [ ] Silent DB auto-creation prevented on mismatched `memory_dir` (#188)
-- [ ] `/health` and `/status` accuracy confirmed (#187)
-- [ ] Service unit files tested end-to-end on a clean Linux host (#185)
+- [ ] `palinode doctor` umbrella complete — all planned checks in
+- [ ] MCP config consistency (`palinode mcp-config --diagnose`) working across all platforms
+- [ ] Silent DB auto-creation prevented on mismatched `memory_dir`
+- [ ] `/health` and `/status` accuracy confirmed
+- [ ] Service unit files tested end-to-end on a clean Linux host
 
 ## Distribution
 - [ ] `palinode init` idempotent on all supported platforms (macOS, Linux)
-- [ ] `palinode deploy-systemd` smoke-tested on Ubuntu 22.04+
+- [ ] `deploy/systemd/install.sh` smoke-tested on Ubuntu 22.04+
 - [ ] Homebrew formula (M6) or documented manual install as fallback
 - [ ] `palinode --version` returns a clean semver string
 
 ## Test coverage
-- [ ] Fresh-session context loading test passing (#186)
-- [ ] Integration test gap closed (#198)
-- [ ] Security suite passing (#123)
+- [ ] Fresh-session context loading test passing
+- [ ] Integration test gap closed
+- [ ] Security suite passing
 - [ ] MCP tool count assertion test (`tests/test_mcp_tool_count.py`) green
 
 ## Platform parity
-- [ ] All 25 MCP tools verified working on Claude Code, Claude Desktop, Cursor
+- [ ] Every MCP tool in the [MCP-SETUP.md](MCP-SETUP.md#available-tools) table verified working on Claude Code, Claude Desktop, Cursor (that table is the inventory; a count written here goes stale every release)
 - [ ] Codex CLI MCP config documented and smoke-tested
 - [ ] Antigravity IDE MCP config documented
 - [ ] `palinode mcp-config --diagnose` covers all supported client paths

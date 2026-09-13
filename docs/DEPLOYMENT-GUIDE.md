@@ -155,6 +155,32 @@ context:
     my-project: project/my-project
 ```
 
+## Injection budgets
+
+The same `context:` block caps what Palinode puts into a context window without
+being asked. The two surfaces are budgeted separately — the startup payload is
+paid once a session, the recall block on every message:
+
+```yaml
+context:
+  injection_max_chars: 6000    # session-start digest (/context/prime,
+  injection_max_tokens: 1500   # palinode_session_init, palinode prime)
+  recall_max_chars: 3000       # per-turn recall block
+  recall_max_tokens: 750
+  core_gist_max_chars: 1500    # `palinode lint` flags core memories above this
+```
+
+Tokens are estimated at 4 chars/token (an estimate, not a tokenizer); both caps
+in a pair are enforced. Set a pair to `0` and that surface keeps only its own
+line/count bounds — the pre-budget behaviour, byte for byte.
+
+Over budget, the digest packs in priority order and degrades in one direction:
+a plain row may be demoted to its gist and pointer, but a kept row never loses a
+qualifier and a conflict never loses a side — conflict groups that do not fit
+become one explicit `⚠ N conflicts omitted for budget — see …` stub that keeps
+the source pointers. Omissions appear in the response's `_budget` object and as
+a WARNING in the API log; nothing is trimmed silently.
+
 Or set `PALINODE_PROJECT=project/my-project` as an env var.
 
 Use `--no-context` on the CLI to disable: `palinode search "query" --no-context`

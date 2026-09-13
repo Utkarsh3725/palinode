@@ -9,6 +9,14 @@ similar existing memories. Runs asynchronously via an in-process asyncio queue
 Errors in the check are logged but never propagate to the save caller. The
 save-never-fails invariant is load-bearing — see ADR-004 for rationale.
 
+The queue carries one other job kind. A ``revalidate`` item (written by
+:func:`palinode.core.revalidation.enqueue_revalidation`) is deterministic
+deferred work: it calls no LLM, re-derives its decision from live disk, and
+records a record's current backing state in its frontmatter. It rides this
+queue because this is where deferred memory writes already go — the same
+marker format, the same startup and idle sweeps, the same ``.failed.json``
+surface when one cannot be applied, and the same ``git_tools`` commit path.
+
 Public API:
     schedule_contradiction_check(file_path, item, *, sync=False, llm_fn=None) -> dict | None
     sweep_pending_markers() -> int
@@ -40,6 +48,13 @@ if TYPE_CHECKING:
     # under `from __future__ import annotations`, which defers evaluation of
     # every annotation in this module to strings.
     from palinode.consolidation.runner import LlmFn
+
+#: Marker item kind for the deterministic backing-revalidation job. Spelled
+#: out rather than imported so the save hot path does not pull in the
+#: resolution stack to enqueue a contradiction check; mirrors
+#: :data:`palinode.core.revalidation.MARKER_KIND`, and
+#: ``tests/test_write_time.py`` pins the two together.
+_REVALIDATE_KIND = "revalidate"
 
 logger = logging.getLogger("palinode.write_time")
 # Ensure INFO logs propagate even if the parent logger tree hasn't been
@@ -382,8 +397,23 @@ def _run_check_and_apply(
 
     Returns:
         {"operations": [...], "applied_stats": {...}}
-        "applied_stats" is empty dict when no ops were applied.
+        "applied_stats" is empty dict when the check proposed nothing
+        actionable. Otherwise it carries `translation_skipped` — the
+        actionable ops `_translate_ops` dropped as malformed — plus, once
+        anything was routed, the executor's stats summed across every file
+        the ops were routed to (see `_route_ops`) and this applier's own
+        `ROUTE_STATS`.
     """
+    # A `revalidate` job is not a contradiction check: it is deterministic,
+    # calls no LLM, and re-derives its own decision from live disk. It rides
+    # this queue because this is where deferred memory writes already go —
+    # same marker, same sweep, same failure surface, same commit path.
+    if item.get("kind") == _REVALIDATE_KIND:
+        from palinode.core import revalidation
+
+        stats = revalidation.apply_revalidation(file_path, item)
+        return {"operations": [], "applied_stats": stats, "llm_latency_ms": 0}
+
     # Import here to avoid circular import at module load time
     from palinode.consolidation.runner import _check_contradictions
     from palinode.consolidation.executor import apply_operations
@@ -402,20 +432,39 @@ def _run_check_and_apply(
         if op_kind(op) not in ("NOOP", "ADD")
     ]
 
+    # The candidate rows each proposal was generated against. Popped so the
+    # returned `operations` keep the shape callers (the sync save result, the
+    # CLI's summary line) already print — the rows are routing input, not
+    # part of the proposal.
+    candidates: list[dict] = []
+    for op in operations:
+        candidates.extend(op.pop("candidates", None) or [])
+
     applied_stats: dict[str, int] = {}
     if actionable:
         # Translate _check_contradictions output to executor input format.
         # _check_contradictions returns {"operation": "UPDATE", "item": {...}, ...}
         # apply_operations expects {"op": "UPDATE", "id": ..., ...}
         executor_ops = _translate_ops(actionable, file_path)
+        # An actionable op the translator produced nothing for was malformed
+        # (no target id, an unknown kind, or an UPDATE with no replacement
+        # text). Counted so a pass that applied nothing still says why.
+        applied_stats["translation_skipped"] = len(actionable) - len(executor_ops)
         if executor_ops:
-            try:
-                applied_stats = apply_operations(file_path, executor_ops)
-                _git_commit_dedup(file_path)
-            except Exception as e:  # noqa: BLE001
-                logger.error(
-                    f"write-time: executor apply failed for {file_path}: {e}"
-                )
+            routed, route_stats = _route_ops(executor_ops, file_path, candidates)
+            applied_stats.update(route_stats)
+            for target, target_ops in routed:
+                try:
+                    file_stats = apply_operations(target, target_ops)
+                    for key, value in file_stats.items():
+                        applied_stats[key] = applied_stats.get(key, 0) + value
+                    _git_commit_dedup(target)
+                    if _mutated(file_stats):
+                        _reindex(target)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        f"write-time: executor apply failed for {target}: {e}"
+                    )
 
     logger.debug(
         f"write-time: check complete file={file_path} "
@@ -441,13 +490,26 @@ def _translate_ops(
         {"op": "UPDATE"|"SUPERSEDE"|..., "id": "...", ...}
 
     Mappings:
-        "UPDATE"  → {"op": "UPDATE", ...}  (update the matched existing line)
-        "DELETE"  → {"op": "SUPERSEDE", ...}  (we don't delete; supersede instead)
+        "UPDATE"  → {"op": "UPDATE", ...}  when the op carries ``new_text``
+                    (rewrite the matched existing line with exactly that text)
+        "UPDATE"  → nothing when it carries none: the op is malformed and is
+                    skipped, with a warning naming the target id
+        "DELETE"  → {"op": "SUPERSEDE", ...}  when the op carries ``new_text``
+                    (we don't delete; the text is the successor line)
+        "DELETE"  → {"op": "ARCHIVE", ...}  when it carries none: a retirement
+                    with no replacement, retired into history
         Everything else is filtered out by the caller.
 
-    Both mappings carry ``new_text`` — the executor's guard on each op
-    requires it (a missing/empty ``new_text`` is treated as a malformed op
-    and dropped without mutation, stats increment, or log line).
+    The replacement text is never synthesised from the saved item. The item's
+    ``content`` is the whole body of the file that triggered the check; a
+    SUPERSEDE inserts ``new_text`` verbatim as one fact line after the
+    tombstone and an UPDATE rewrites the target line with it — a multi-line
+    save used to land in the target as a single line carrying every fact id
+    it contained, duplicating each of them. A text-less DELETE is what the
+    checker means by "this fact is retired"; the executor's ARCHIVE is that
+    op, and its ADR-020 guard rejects it on a superseded-only (identity)
+    document rather than forging a successor. A text-less UPDATE says nothing
+    the executor could apply, so it is dropped rather than guessed at.
     """
     translated = []
     for op in contradiction_ops:
@@ -458,37 +520,161 @@ def _translate_ops(
             continue
 
         if operation == "UPDATE":
+            new_text = op.get("new_text")
+            if not new_text:
+                logger.warning(
+                    "write-time: UPDATE skipped — fact id=%r carries no new_text; "
+                    "the saved body is never used as the replacement",
+                    target_id,
+                )
+                continue
             translated.append(
                 {
                     "op": "UPDATE",
                     "id": target_id,
-                    "new_text": op.get("new_text")
-                    or op.get("item", {}).get("content", ""),
+                    "new_text": new_text,
                     "reason": op.get("reason", "write-time dedup"),
                 }
             )
         elif operation == "DELETE":
-            translated.append(
-                {
-                    "op": "SUPERSEDE",
-                    "id": target_id,
-                    # The executor's SUPERSEDE writes `new_text` as the
-                    # replacement fact line inserted after the strikethrough
-                    # of the old one (see executor._supersede_fact) — it is
-                    # not optional. A write-time DELETE means the new item
-                    # (op["item"]) is what superseded the target fact, so its
-                    # content is the replacement text, mirroring how
-                    # `superseded_by` below already sources the new item's id.
-                    # Without this key the executor's `if fact_id and new_text`
-                    # guard silently drops the op — the write-time-DELETE bug
-                    # this translation exists to fix.
-                    "new_text": op.get("new_text")
-                    or op.get("item", {}).get("content", ""),
-                    "superseded_by": op.get("item", {}).get("id", ""),
-                    "reason": op.get("reason", "write-time: superseded"),
-                }
-            )
+            new_text = op.get("new_text")
+            if new_text:
+                translated.append(
+                    {
+                        "op": "SUPERSEDE",
+                        "id": target_id,
+                        # Inserted verbatim as the successor fact line after
+                        # the tombstone (see executor._supersede_fact).
+                        "new_text": new_text,
+                        "superseded_by": op.get("item", {}).get("id", ""),
+                        "reason": op.get("reason", "write-time: superseded"),
+                    }
+                )
+            else:
+                translated.append(
+                    {
+                        "op": "ARCHIVE",
+                        "id": target_id,
+                        "reason": op.get("reason", "write-time: retired"),
+                    }
+                )
     return translated
+
+
+#: Executor stats that mean the target file's body changed. The rejection and
+#: no-op counters (``unmatched``, ``*_rejected``, ``kept``) are excluded so a
+#: dropped op never triggers a reindex of an untouched file.
+_MUTATION_STATS = ("updated", "merged", "superseded", "archived", "retracted",
+                   "contradicts_proposed")
+
+#: Stats this applier adds to the executor's, always present once ops were
+#: routed so a quiet pass reports ``0`` rather than omitting the key.
+ROUTE_STATS: tuple[str, ...] = ("ambiguous_rejected", "stale_rejected")
+
+
+def _mutated(stats: dict[str, int]) -> bool:
+    return any(stats.get(key, 0) for key in _MUTATION_STATS)
+
+
+def _route_ops(
+    executor_ops: list[dict], file_path: str, candidates: list[dict]
+) -> tuple[list[tuple[str, list[dict]]], dict[str, int]]:
+    """Group executor ops by the file that owns each op's target fact.
+
+    The contradiction check retrieves candidates across every stored file,
+    but ``apply_operations`` is per-file and used to be called on the
+    just-saved file only. A proposal naming a fact that lives in another file
+    was therefore dropped as ``unmatched`` (the fact is not in the saved
+    file), and one naming an id that happens to exist in *both* the saved
+    file and a candidate mutated the saved file's copy — the wrong target.
+
+    Ownership is resolved against the candidate rows the proposal was
+    generated from, not a store-wide lookup: the model could only name a fact
+    it saw. Three outcomes per op:
+
+    * exactly one candidate file carries the id → the op goes to that file,
+      **provided** the candidate section it was proposed against is still
+      what is on disk (``store.check_freshness`` against the row's
+      ``content_hash``). A stale section means the target changed between
+      proposal and application; the op is rejected as ``stale_rejected``
+      rather than applied last-write-wins.
+    * more than one candidate file carries the id → ``ambiguous_rejected``.
+      The executor could only ever pick one, and there is no deterministic
+      way to know which the model meant.
+    * no candidate carries the id → the op goes to the saved file, exactly
+      as before. The executor reports it ``unmatched`` if the id is not there
+      either.
+
+    Returns ``(routed, stats)``: ``routed`` is ``[(target_path, ops), …]`` in
+    first-seen order, ``stats`` holds the two rejection counters.
+    """
+    from palinode.consolidation.status_doc import fact_ids
+    from palinode.core import store
+
+    stats = {key: 0 for key in ROUTE_STATS}
+
+    # fact id → {realpath: (spelling, [candidate rows carrying the id])}
+    owners: dict[str, dict[str, tuple[str, list[dict]]]] = {}
+    for row in candidates:
+        path = row.get("file_path") or ""
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            path = os.path.join(config.palinode_dir, path)
+        key = os.path.realpath(path)
+        for fid in fact_ids(row.get("content") or ""):
+            spelling, rows = owners.setdefault(fid, {}).setdefault(key, (path, []))
+            rows.append(row)
+
+    saved_key = os.path.realpath(file_path)
+    routed: dict[str, list[dict]] = {}
+    for op in executor_ops:
+        fid = op.get("id")
+        files = owners.get(fid, {})
+        if len(files) > 1:
+            logger.warning(
+                "write-time: %s rejected — fact id=%r is present in %d candidate "
+                "files, target is ambiguous: %s",
+                op.get("op"), fid, len(files),
+                ", ".join(sorted(os.path.relpath(p, config.palinode_dir) for p, _ in files.values())),
+            )
+            stats["ambiguous_rejected"] += 1
+            continue
+        if files:
+            key, (spelling, rows) = next(iter(files.items()))
+            target = file_path if key == saved_key else spelling
+            fresh = store.check_freshness([dict(r) for r in rows])
+            if any(r.get("freshness") == "stale" for r in fresh):
+                logger.warning(
+                    "write-time: %s rejected — fact id=%r in %s changed on disk "
+                    "since the proposal was generated (stale precondition)",
+                    op.get("op"), fid, os.path.relpath(target, config.palinode_dir),
+                )
+                stats["stale_rejected"] += 1
+                continue
+        else:
+            target = file_path
+        routed.setdefault(target, []).append(op)
+
+    return list(routed.items()), stats
+
+
+def _reindex(file_path: str) -> None:
+    """Re-index a file this pass mutated, so the store's row (and the
+    ``content_hash`` the next proposal's precondition is checked against)
+    reflects what is on disk without waiting for the watcher. Best-effort:
+    a failure is logged, never raised — the file is on disk and reaches the
+    index when the watcher next sees it."""
+    try:
+        from palinode.indexer.index_file import index_file
+
+        outcome = index_file(file_path)
+        if outcome.get("error"):
+            logger.warning(
+                "write-time: reindex reported %s for %s", outcome["error"], file_path,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("write-time: reindex failed for %s: %s", file_path, exc)
 
 
 def _git_commit_dedup(file_path: str) -> None:
@@ -496,11 +682,18 @@ def _git_commit_dedup(file_path: str) -> None:
 
     Keeps history clean: you can blame a memory line back to either the
     original user save or the subsequent write-time dedup pass. Through the
-    git_tools choke point (commit_memory_file) rather than a raw
+    git_tools choke point (commit_memory_files) rather than a raw
     subprocess.run — that primitive already no-ops when
     config.git.auto_commit is off and already logs its own I/O failures, so
-    this is now a thin wrapper for the dedup-specific commit message.
+    this is a thin wrapper for the dedup-specific commit message.
+
+    Stages the target's ``-history.md`` sibling with it when one exists: a
+    SUPERSEDE appends the retired text there, and the runner's compaction
+    commit (``runner._touched_files``) already treats the pair as one
+    mutation. Left out, the sibling sat untracked until some later sweep.
     """
+    from palinode.consolidation.runner import _touched_files
+
     rel = os.path.relpath(file_path, config.palinode_dir)
     msg = f"{config.git.commit_prefix} write-time dedup: {rel}"
-    git_tools.commit_memory_file(file_path, msg)
+    git_tools.commit_memory_files(_touched_files(file_path), msg)
